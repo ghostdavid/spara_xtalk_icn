@@ -54,14 +54,11 @@ project2/
 ├── requirements.txt            # 依赖清单
 ├── README.md                   # 本文件
 ├── backup/                     # 备份输出目录 backup/<时间戳>_<版本>/
-├── sample_data/
-│   └── demo.s8p                # 示例 S 参数文件
-└── tests/
-    ├── test_sparam.py          # 回归测试（python tests/test_sparam.py，纯 assert 无需 pytest）
-    ├── _smoke_gui.py           # GUI 端到端冒烟测试（python tests/_smoke_gui.py）
-    ├── synth_touchstone.py     # 确定性合成 Touchstone 用例生成器
-    └── snapshot_v3.3.json      # 旧版（v3.3）参考快照
+└── sample_data/
+    └── demo.s8p                # 示例 S 参数文件
 ```
+
+（`tests/` 回归测试目录仅保留在本地，不上传 GitHub。）
 
 ## 备份流程
 

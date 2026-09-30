@@ -181,3 +181,6 @@ cython_debug/
 .cursorindexingignore
 # PyInstaller 构建配置 (Python 模板误伤 *.spec, 此处豁免)
 !main.spec
+
+# 本地测试目录 (不上传 GitHub)
+tests/
