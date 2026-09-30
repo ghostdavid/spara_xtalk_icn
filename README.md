@@ -1,90 +1,48 @@
 # S参数 PowerSum 串扰计算工具
 
-解析 Touchstone (.sNp) S 参数文件并计算功率和 (PowerSum) 串扰指标 **PSFEXT / PSNEXT / PSXT**，提供 ttkbootstrap cosmo 主题的图形界面，支持**差分 (Differential)** 与**单端 (Single-Ended)** 两种模式。由 V3.3 单文件版本重构而来。
+一款面向信号完整性（SI）仿真的桌面工具：导入 Touchstone（.sNp）S 参数文件，快速计算并绘制串扰功率和指标 **PSFEXT（远端串扰）/ PSNEXT（近端串扰）/ PSXT（总串扰）**，支持差分（Differential）与单端（Single-Ended）两种分析模式。
 
-## 环境要求
+典型场景：DDR/LPDDR 等并行总线的布线串扰评估——从仿真工具（HFSS / SIwave / Cadence 等）导出多端口 S 参数，勾选受害线（Victim）与攻击线（Aggressor），即可得到各频段的总串扰包络曲线，用于对比不同布线方案的串扰裕量。
 
-- Python 3.10+（项目 venv 为 3.14）
-- 依赖版本见 `requirements.txt`（numpy / scipy / matplotlib / ttkbootstrap）
-
-## 安装
+## 安装与运行
 
 ```bash
 pip install -r requirements.txt
+python main.py                # 打开空界面
+python main.py 路径/文件.s4p   # 启动时自动导入指定文件
 ```
 
-如需隔离环境，可先创建并激活 venv 后再安装：
+- Python 3.10+，依赖 numpy / scipy / matplotlib / ttkbootstrap
+- 软件自带示例文件 `sample_data/demo.s8p`（8 端口 DDR 数据线示例，仅供上手演示）
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-pip install -r requirements.txt
-```
+## 界面说明
 
-## 使用方法
+主窗口分为左右两部分，底部为状态栏。
 
-### 1. 源码运行（打开空界面）
+**左侧面板 — 设置与操作**
 
-```bash
-python main.py
-```
+| 控件 | 功能 |
+| --- | --- |
+| S参数文件 | 选择导入 .sNp 文件；导入后显示文件原始阻抗 Z0 |
+| 计算模式 | 差分模式（Victim 勾选 2 个端口，攻击端口成对勾选）或单端模式（Victim 勾选 1 个端口） |
+| Z0 | 参考阻抗（Ω），S 参数自动重归一化到该阻抗，默认 50 |
+| Freq [min/max/step] | 计算频率范围与步长（GHz），修改后自动重算 |
+| 端口自动勾选 | 仅需手动指定受害端口，按封装引脚排列（排列一/排列二）自动推演攻击端口 |
+| 保存当前文件配置 | 将端口勾选等配置存为同名 .json，重新导入该文件时自动恢复 |
 
-### 2. 命令行自动导入
+**右侧面板 — 端口勾选映射表**
 
-```bash
-python main.py 路径/文件.s4p
-```
+导入文件后列出全部端口（含端口名），每行可勾选三类角色：Victim（受害）、FEXT（远端攻击）、NEXT（近端攻击）；支持按列快捷全选。差分模式下攻击端口须成对勾选。
 
-启动后自动导入指定的 S 参数文件。
+**图表窗口**
 
-### 3. 独立 exe
+- 自动计算并绘制 MDFEXT / MDNEXT / PSXT 三条功率和曲线（修改参数即时重算）；
+- Mark Freq（GHz）：在指定频率上限内自动标注 PSXT 峰值点，便于读数；
+- 差分与单端模式可实时切换对比。
 
-在 PyCharm 中运行 `pyinstaller main.spec` 打包，生成 `dist/S参数PowerSum串扰计算.exe`，双击即可使用，可将 .sNp 文件拖入窗口或在界面中选择文件。
+## 计算口径
 
-## 项目结构
-
-```text
-project2/
-├── main.py                     # 程序入口（约 30 行）：构建主窗口，处理命令行自动导入
-├── app.py                      # GUI 主程序（ttkbootstrap cosmo 主题，差分/单端模式）
-├── sparam_core.py              # 纯计算核心（不依赖 tkinter）：SParameter 解析器
-│                               #   + snp2smp / s2sdd / safe_db / interp_spline / power_sum_db
-├── backup.py                   # 版本备份工具
-├── main.spec                   # PyInstaller 打包配置
-├── requirements.txt            # 依赖清单
-├── README.md                   # 本文件
-├── backup/                     # 备份输出目录 backup/<时间戳>_<版本>/
-└── sample_data/
-    └── demo.s8p                # 示例 S 参数文件
-```
-
-（`tests/` 回归测试目录仅保留在本地，不上传 GitHub。）
-
-## 备份流程
-
-每次修改代码前运行一次：
-
-```bash
-python backup.py            # 生成 backup/20260904_153000/
-python backup.py v3.4       # 生成 backup/20260904_153000_v3.4/
-```
-
-自动将 `*.py`、`*.spec`、`README.md`、`requirements.txt` 备份到 `backup/<时间戳>_<标签>/`，排除 `.venv`、`dist`、`.idea`、`__pycache__` 等目录。
-
-## 打包
-
-```bash
-pyinstaller main.spec
-```
-
-产出目录版 `dist/S参数PowerSum串扰计算_dir/`（启动约 0.5–2 秒）。把整个文件夹复制到目标位置，对其中 exe 右键「发送到桌面快捷方式」即可。
-
-说明：曾验证过单文件版（onefile），但每次启动需向 `%TEMP%\_MEI*` 解包并被 Windows Defender 持续扫描，实测 8–9 秒且偶发 120 秒级尖峰，故 spec 已改为只产出目录版。若确需单文件分发，加 Defender 排除项是唯一有效提速手段。另外，PyInstaller 无 ttkbootstrap 钩子，spec 中已通过 `collect_data_files('ttkbootstrap')` 显式收集主题图标字体，否则打包后启动即报 `bootstrap.ttf` 缺失。
-
-## 测试
-
-```bash
-python tests/test_sparam.py
-```
-
-回归测试对比两组基线：旧版快照（`tests/snapshot_v3.3.json`）与解析解（由 `tests/synth_touchstone.py` 的确定性公式推得），输出全部 **PASS** 即通过。纯 assert 实现，无需 pytest。
+- 功率和：各攻击路径线性功率相加后再取 dB，即 PSXT = 10·log10(Σ 10^(dBᵢ/10))（假设各攻击源非相干）；
+- 差分模式：对受害端口对做混合模（Mixed-Mode）转换后取 Sdd 耦合项；
+- 插值：对 dB 曲线做三次样条插值到目标频率网格，量程外钳位于 −100 dB；
+- 结果仅在文件实际频率范围内有效。
