@@ -2,7 +2,7 @@
 
 纯数值模块，不依赖任何 GUI 库：
 - SParameter: Touchstone .sNp 文件解析器
-- snp2smp / s2sdd / safe_db / interp_spline: S 参数数学工具
+- snp2smp / s2sdd / safe_db / interp_curve: S 参数数学工具
 - power_sum_db: PSFEXT / PSNEXT / PSXT 功率和计算
 
 从 V3.3 单文件版本重构而来，解析语义与原实现保持一致，
@@ -12,7 +12,9 @@
   打分选优（原来取第一个能整除的 n，几乎总会误判成 1 端口）；
 - standard / repeated 布局同时整除时（如 2 端口 repeated 恰有 9 的倍数个频点），
   按频率列单调性消歧（原来无条件选 standard，会静默解析出垃圾矩阵）；
-- interp_spline 忽略 NaN/-inf 点而不是先替换成 -100，避免样条振铃过冲；
+- 插值改到线性功率域并采用单调 Hermite (PCHIP)，原 dB 域样条的过冲
+  经 10**(dB/10) 还原后会被指数放大成虚假尖峰（见 power_sum_db）；
+- interp_curve 忽略 NaN/-inf 点而不是先替换成 -100，避免振铃过冲；
 - 数据行含非法 token 时整行丢弃，不再把行内前半段数字残留进数据流。
 """
 
@@ -20,7 +22,7 @@ import os
 import re
 
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import PchipInterpolator
 
 
 # ==================== Touchstone S参数文件解析器 ====================
@@ -306,11 +308,15 @@ def safe_db(s_complex):
     return 20.0 * np.log10(mag)
 
 
-def interp_spline(x_src, y_src, x_dst):
-    """三次样条插值，忽略 -inf / NaN 点（而非用 -100 填充后插值）
+def interp_curve(x_src, y_src, x_dst, fill_value=-100.0):
+    """单调分段三次 Hermite 插值 (PCHIP)，忽略 -inf / NaN 点
 
-    把非有限值替换成 -100 再插值会在样条中引入尖刺并产生振铃过冲;
-    这里只拿有限点构造样条。有限点不足 2 个时退化为常量填充。
+    选用 PCHIP 而非普通三次样条的原因：PCHIP 保单调、不过冲，
+    插值结果严格介于相邻节点值之间。功率包络在节点间不应出现
+    超出邻域的峰/谷，普通样条的振铃过冲会把假峰引入功率和。
+    忽略非有限点（而非用常数填充后插值），有限点不足 2 个时
+    退化为常量填充。
+    fill_value: 量程外与非有限结果的钳位值（缺省 -100 为 dB 域约定）。
     """
     y_src = np.asarray(y_src, dtype=float)
     x_src = np.asarray(x_src, dtype=float)
@@ -318,11 +324,11 @@ def interp_spline(x_src, y_src, x_dst):
 
     good = np.isfinite(y_src)
     if np.count_nonzero(good) >= 2:
-        cs = CubicSpline(x_src[good], y_src[good], extrapolate=False)
+        cs = PchipInterpolator(x_src[good], y_src[good], extrapolate=False)
         result = cs(x_dst)
-        return np.where(np.isfinite(result), result, -100.0)
+        return np.where(np.isfinite(result), result, fill_value)
 
-    fill = float(np.mean(y_src[good])) if np.any(good) else -100.0
+    fill = float(np.mean(y_src[good])) if np.any(good) else fill_value
     return np.full_like(x_dst, fill)
 
 
@@ -375,8 +381,16 @@ def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
         if not attack_ports:
             return np.zeros(len(fn))
         curves = coupled_db(attack_ports)
-        interp = np.array([interp_spline(spara_freq, c, fn) for c in curves])
-        return np.sum(10.0 ** (interp / 10.0), axis=0)
+        # 不能在 dB 域插值: 样条在 dB 域的过冲, 经 10**(dB/10) 还原到
+        # 线性功率后会被指数放大成虚假尖峰 (深谷旁的 -80dB 点可使过冲
+        # 在线性域膨胀多个数量级)。因此先转线性功率域再插值;
+        # PCHIP 保单调不过冲, 负值截断为 0 (功率非负)。
+        # 量程外钳位 1e-10 (= -100 dB 的线性功率), 保持既有显示约定。
+        powers = [10.0 ** (c / 10.0) for c in curves]
+        interp = np.array([interp_curve(spara_freq, p, fn, fill_value=1e-10)
+                           for p in powers])
+        interp = np.clip(interp, 0.0, None)
+        return np.sum(interp, axis=0)
 
     fext_power = power_sum(f_ports)
     next_power = power_sum(n_ports)
