@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
-# 只产出目录版: dist/S参数PowerSum串扰计算_dir/
+# 只产出目录版: dist/S参数串扰计算_dir/
 # (单文件版每次启动需向 %TEMP%\_MEI* 解包并被杀软扫描, 实测 8-9s 且偶发
 #  120s 级尖峰; 目录版启动 1-2s, 故弃用 onefile)
 
@@ -20,8 +20,8 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # scipy 子包高度互联 (interpolate -> optimize -> linalg -> fft ...),
-        # 逐个排除会触发连锁缺失, 故只排除与 scipy 无耦合的测试/构建包
+        # 运行时依赖 scipy (PCHIP 插值), 不能排除;
+        # 只排除与运行时无关的测试/构建包
         'numpy.tests', 'numpy.distutils', 'matplotlib.tests',
         'tkinter.test', 'tkinter.tix',
         'pip', 'setuptools', 'distutils',
@@ -32,13 +32,13 @@ a = Analysis(
 pyz = PYZ(a.pure)
 
 
-# ---- onedir: dist/S参数PowerSum串扰计算_dir/S参数PowerSum串扰计算.exe ----
+# ---- onedir: dist/S参数串扰计算_dir/S参数串扰计算.exe ----
 exe = EXE(
     pyz,
     a.scripts,
     [],
     exclude_binaries=True,
-    name='S参数PowerSum串扰计算',
+    name='S参数串扰计算',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -57,5 +57,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='S参数PowerSum串扰计算_dir',
+    name='S参数串扰计算_dir',
 )

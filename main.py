@@ -1,4 +1,4 @@
-"""S参数 PowerSum 串扰计算工具 —— 程序入口。
+"""S参数串扰计算工具 —— 程序入口。
 
 用法:
     python main.py                  # 打开空界面
@@ -18,7 +18,7 @@ from app import SParamPowerSumApp
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
 
-    root = ttk.Window(title='S参数 PowerSum 串扰计算', themename='cosmo')
+    root = ttk.Window(title='S参数串扰计算', themename='cosmo')
     app = SParamPowerSumApp(root)
 
     if argv:

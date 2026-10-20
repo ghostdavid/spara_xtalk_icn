@@ -1,5 +1,14 @@
-# S参数 PowerSum 串扰计算工具的依赖清单（pip install -r requirements.txt）
-numpy==2.5.2
-scipy==1.18.1
-matplotlib==3.11.1
-ttkbootstrap==2.2.2
+# S参数串扰计算工具 —— 运行依赖
+# 安装: pip install -r requirements.txt
+# 运行环境: Python 3.10+（开发环境为 3.14）
+
+numpy==2.5.2        # 数值计算（矩阵、插值网格、公式求值）
+scipy==1.18.1       # PCHIP 插值（S 参数重采样到等间隔网格）
+matplotlib==3.11.1  # 功率和曲线绘制（TkAgg 后端嵌入 GUI）
+ttkbootstrap==2.2.2 # Tk 界面主题组件
+
+# ---- 可选：仅打包 exe 时需要 ----
+# pyinstaller==6.22.2
+
+# ---- 可选：仅运行本地测试脚本时需要 ----
+# pillow==12.3.0    # tests/ 下 GUI 冒烟测试的截图功能

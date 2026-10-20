@@ -184,3 +184,6 @@ cython_debug/
 
 # 本地测试目录 (不上传 GitHub)
 tests/
+
+# backup.py 生成的本地备份目录
+backup/

@@ -19,7 +19,7 @@ BACKUP_ROOT = PROJECT_ROOT / 'backup'
 # 只备份源码与项目文件，不备份虚拟环境、打包产物和 IDE 配置
 INCLUDE_FILES = ('*.py', '*.spec', 'README.md', 'requirements.txt')
 EXCLUDE_DIRS = {'.venv', 'venv', '.idea', '__pycache__', 'dist', 'build',
-                'backup', '.git', '.zcode', 'plans'}
+                'backup', '.git', 'plans'}
 
 
 def iter_project_files():

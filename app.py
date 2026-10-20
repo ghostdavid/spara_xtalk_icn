@@ -1,4 +1,4 @@
-"""S参数 PowerSum 串扰计算工具 —— GUI 主程序 (ttkbootstrap)。
+"""S参数串扰计算工具 —— GUI 主程序 (ttkbootstrap)。
 
 布局:
 - 主窗口左栏: 「S参数文件」「计算参数」「端口自动勾选」三个分组
@@ -20,26 +20,51 @@ import json
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
+import types
 from pathlib import Path
 
 import numpy as np
 import ttkbootstrap as ttk
 
-from sparam_core import SParameter, power_sum_db
+from sparam_core import (DEFAULT_FORMULAS, SParameter, diff_pair,
+                         evaluate_expr, find_broken_pairs, icn_calculate,
+                         order_ports_by_pairs, power_sum_db, resample_sparams)
 
 
 class SParamPowerSumApp:
     DIFF_MODE = '差分模式 (Differential)'
     SE_MODE = '单端模式 (Single-Ended)'
 
+    # ICN / ccICN 标量输入默认值 (字符串形式, 支持小数/科学计数法/表达式)
+    _ICN_SCALAR_DEFAULTS = (
+        ('ant_v', '0.5'),      # 近端攻击幅度 Ant (V), 中轴到 peak
+        ('aft_v', '0.4'),      # 远端攻击幅度 Aft (V), 中轴到 peak
+        ('fb_hz', '32e9'),     # 信号波特率 fb (Hz)
+        ('tnt_s', '7.5e-12'),  # 近端攻击上升时间 Tnt (s)
+        ('tft_s', '7.5e-12'),  # 远端攻击上升时间 Tft (s)
+        ('pam', '4'),          # PAM 电平数
+        ('il_n', '2*8.5'),     # 近端攻击路径损耗 ILn (dB)
+        ('il_f', '22.75+8.5'),  # 远端攻击路径损耗 ILf (dB)
+    )
+    # 输入框键 -> 公式环境中的变量名
+    _ICN_SCALAR_ENV = {
+        'ant_v': 'Ant', 'aft_v': 'Aft', 'fb_hz': 'fb',
+        'tnt_s': 'Tnt', 'tft_s': 'Tft', 'pam': 'PAM',
+        'il_n': 'ILn', 'il_f': 'ILf',
+    }
+
     # 配置字段映射: (JSON 键, 变量属性名)
     _SCALAR_FIELDS = (
         ('mode_val', 'mode_var'), ('Z0', 'z0_var'), ('fmin', 'fmin_var'),
         ('fmax', 'fmax_var'), ('fstep', 'fstep_var'),
+        ('name_align', 'name_align_var'),
         ('mark_freq', 'mark_freq_var'), ('chk_fext', 'chk_fext_var'),
         ('chk_next', 'chk_next_var'), ('chk_psxt', 'chk_psxt_var'),
         ('auto_select', 'auto_select_var'), ('arrange', 'arrange_var'),
-    )
+        ('icn_enabled', 'icn_enabled_var'),
+    ) + tuple((key, key + '_var') for key, _ in _ICN_SCALAR_DEFAULTS) \
+      + tuple(('formula_' + key, 'formula_var_' + key)
+              for key in DEFAULT_FORMULAS)
     # 端口勾选: (JSON 键, port_vars 元组中的下标)
     _PORT_FIELDS = (
         ('v_ports', 0), ('f_ports', 1), ('n_ports', 2),
@@ -56,7 +81,7 @@ class SParamPowerSumApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title('S参数 PowerSum 串扰计算')
+        self.root.title('S参数串扰计算')
 
         self._setup_scaling()
 
@@ -69,11 +94,27 @@ class SParamPowerSumApp:
         self._suppress_auto = 0
         self._recalc_job = None
         self._redraw_job = None
+        # S 参数重采样缓存: (基本参数 key, 归一化+重采样后的数据)。
+        # 仅在基本参数 (Z0/fmin/fmax/fstep) 或文件变化时重建,
+        # 端口勾选/ICN 变量等修改直接复用, 保证快速重算
+        self._sparam_cache = None
 
         self.fig = None
         self.ax = None
         self.canvas_mpl = None
         self.plot_window = None
+
+        # ICN / ccICN 状态: 启用开关、最近一次计算结果、当前正在编辑的
+        # 公式键 (同一时间只允许编辑一条)
+        self.icn_enabled_var = ttk.BooleanVar(value=True)
+        self._last_icn_results = None
+        self._formula_editing = None
+        # 「计算数据」表格状态: 单元格变量、当前列签名、表格外框容器、
+        # 最近一次 Mark 峰值 (曲线名 -> (频率 GHz, 峰值 dB))
+        self.data_table_vars = {}
+        self._data_table_cols = None
+        self._table_outer = None
+        self._last_mark_peaks = {}
 
         # 曲线开关与 Mark Freq 变量在主窗口构建前创建 (配置恢复依赖它们);
         # mark_freq 的防抖重绘 trace 只注册一次, 避免图表窗口重开时重复注册
@@ -82,6 +123,8 @@ class SParamPowerSumApp:
         self.chk_psxt_var = ttk.BooleanVar(value=True)
         self.mark_freq_var = ttk.StringVar(value='')
         self.mark_freq_var.trace_add('write', lambda *_: self._schedule_redraw())
+        # 端口名对齐方式: 左 / 居中 / 右
+        self.name_align_var = ttk.StringVar(value='左')
 
         self._build_ui()
         self._load_last_config()
@@ -122,12 +165,15 @@ class SParamPowerSumApp:
         main_paned = ttk.Panedwindow(self.root, orient='horizontal')
         main_paned.pack(fill='both', expand=True, padx=10, pady=(8, 0))
 
-        # ===== 左侧面板 =====
+        # ===== 左侧面板 (内容过长, 用可滚动容器) =====
         left_frame = ttk.LabelFrame(main_paned, text='设置与操作', padding=10)
         main_paned.add(left_frame, weight=0)
         left_frame.columnconfigure(0, weight=1)
+        left_frame.rowconfigure(0, weight=1)
+        panel = ttk.ScrolledFrame(left_frame, autohide=True)
+        panel.grid(row=0, column=0, sticky='nsew')
 
-        file_group = ttk.LabelFrame(left_frame, text='S参数文件', padding=8)
+        file_group = ttk.LabelFrame(panel, text='S参数文件', padding=8)
         file_group.grid(row=0, column=0, sticky='ew', pady=(0, 6))
         file_group.columnconfigure(0, weight=1)
         self.path_btn = ttk.Button(file_group, text='点击此处选择 .sNp 文件...',
@@ -139,7 +185,7 @@ class SParamPowerSumApp:
                   font=('TkDefaultFont', 8)).grid(row=1, column=0, sticky='w',
                                                   pady=(4, 0))
 
-        param_group = ttk.LabelFrame(left_frame, text='计算参数', padding=8)
+        param_group = ttk.LabelFrame(panel, text='基本参数', padding=8)
         param_group.grid(row=1, column=0, sticky='ew', pady=(0, 6))
         param_group.columnconfigure(0, weight=1)
 
@@ -159,23 +205,94 @@ class SParamPowerSumApp:
         self.z0_var.trace_add('write', lambda *_: self._schedule_recalculate())
 
         ttk.Label(param_group,
-                  text='Freq (GHz) [ min / max / step ]:').grid(row=3, column=0,
-                                                                sticky='w')
+                  text='Freq (Hz) [ min / max / step ]:').grid(row=3, column=0,
+                                                               sticky='w')
         freq_frame = ttk.Frame(param_group)
         freq_frame.grid(row=4, column=0, sticky='ew', pady=(2, 0))
         freq_frame.columnconfigure((0, 1, 2), weight=1, uniform='freq')
-        self.fmin_var = ttk.DoubleVar(value=0.01)
-        self.fmax_var = ttk.DoubleVar(value=80.0)
-        self.fstep_var = ttk.DoubleVar(value=0.01)
+        # StringVar + 科学计数法显示 (如 1e+07), 支持表达式输入,
+        # 重算时经 evaluate_expr 求值; 修改任一基本参数都会触发
+        # S 参数重采样缓存重建 (见 auto_calculate)
+        self.fmin_var = ttk.StringVar(value='1e+07')
+        self.fmax_var = ttk.StringVar(value='8e+10')
+        self.fstep_var = ttk.StringVar(value='1e+07')
         for col, var in enumerate((self.fmin_var, self.fmax_var, self.fstep_var)):
-            ttk.Entry(freq_frame, textvariable=var, width=8).grid(
+            ttk.Entry(freq_frame, textvariable=var, width=8,
+                      font=('Consolas', 9)).grid(
                 row=0, column=col, sticky='ew', padx=(0 if col == 0 else 2, 0))
             var.trace_add('write', lambda *_: self._schedule_recalculate())
 
-        auto_group = ttk.LabelFrame(left_frame,
+        # ===== ICN / ccICN 参数: 启用开关 + 变量输入 + 公式编辑区 =====
+        icn_group = ttk.LabelFrame(panel, text='ICN相关计算', padding=8)
+        icn_group.grid(row=2, column=0, sticky='ew', pady=(0, 6))
+        icn_group.columnconfigure(1, weight=1)
+
+        # 启用开关: 关闭时不计算 ICN/ccICN, 「计算数据」表格也不显示对应列
+        ttk.Checkbutton(icn_group, text='启用 ICN / ccICN 计算',
+                        variable=self.icn_enabled_var,
+                        bootstyle='round-toggle',
+                        command=self._on_icn_toggle).grid(
+            row=0, column=0, columnspan=3, sticky='w', pady=(0, 4))
+
+        icn_labels = {
+            'ant_v': 'Ant 近端幅度 (V) 非pk-pk值',
+            'aft_v': 'Aft 远端幅度 (V) 非pk-pk值',
+            'fb_hz': 'fb 波特率 (Hz)',
+            'tnt_s': 'Tnt 近端上升时间 (s)',
+            'tft_s': 'Tft 远端上升时间 (s)',
+            'pam': 'PAM 电平数',
+            'il_n': 'ILn 近端路径损耗 (dB)',
+            'il_f': 'ILf 远端路径损耗 (dB)',
+        }
+        # 变量输入: StringVar 保存原始文本, 支持高精度小数/科学计数法/表达式,
+        # 不做任何四舍五入, 重算时才求值
+        self.icn_scalar_vars = {}
+        for row, (key, default) in enumerate(self._ICN_SCALAR_DEFAULTS,
+                                             start=1):
+            ttk.Label(icn_group, text=icn_labels[key] + ':').grid(
+                row=row, column=0, sticky='w', pady=1)
+            var = ttk.StringVar(value=default)
+            self.icn_scalar_vars[key] = var
+            setattr(self, key + '_var', var)
+            ttk.Entry(icn_group, textvariable=var, width=16,
+                      font=('Consolas', 9)).grid(
+                row=row, column=1, sticky='e', pady=1)
+            var.trace_add('write', lambda *_: self._schedule_recalculate())
+
+        # ---- 公式区: 只读展示; 点「编辑」方可修改, 点「完成」校验并生效 ----
+        ttk.Separator(icn_group, orient='horizontal').grid(
+            row=9, column=0, columnspan=3, sticky='ew', pady=(6, 4))
+        ttk.Label(icn_group,
+                  text='计算公式 (点击「编辑」修改, 「完成」生效):',
+                  font=('TkDefaultFont', 8, 'bold')).grid(
+            row=10, column=0, columnspan=3, sticky='w')
+
+        self.formula_vars = {}
+        self.formula_widgets = {}
+        for row, (key, default) in enumerate(DEFAULT_FORMULAS.items(),
+                                             start=11):
+            ttk.Label(icn_group, text=key,
+                      font=('TkDefaultFont', 8)).grid(
+                row=row, column=0, sticky='w', pady=1)
+            var = ttk.StringVar(value=default)
+            self.formula_vars[key] = var
+            setattr(self, 'formula_var_' + key, var)
+            # 输入框固定宽度展示 (公式可点选全量复制查看)
+            entry = ttk.Entry(icn_group, textvariable=var, width=30,
+                              font=('Consolas', 8), state='readonly')
+            entry.grid(row=row, column=1, sticky='ew', pady=1, padx=(4, 2))
+            btn = ttk.Button(icn_group, text='编辑', width=4,
+                             bootstyle='secondary-outline',
+                             command=lambda k=key: self._toggle_formula_edit(k))
+            btn.grid(row=row, column=2, sticky='e', pady=1)
+            self.formula_widgets[key] = (entry, btn)
+
+        # (计算结果不在此处展示; 在「计算结果」窗口曲线图下方的「计算数据」表格中)
+
+        auto_group = ttk.LabelFrame(panel,
                                     text='端口自动勾选 (仅标准对称S参数可用)',
                                     padding=8)
-        auto_group.grid(row=2, column=0, sticky='ew', pady=(0, 6))
+        auto_group.grid(row=3, column=0, sticky='ew', pady=(0, 6))
         self.auto_select_var = ttk.BooleanVar(value=False)
         ttk.Checkbutton(
             auto_group,
@@ -190,11 +307,10 @@ class SParamPowerSumApp:
                         variable=self.arrange_var, value='Type2',
                         command=self.on_arrange_changed).pack(anchor='w', padx=(10, 0))
 
-        left_frame.rowconfigure(3, weight=1)
-        ttk.Button(left_frame, text='保存当前文件配置', command=self.save_config,
+        ttk.Button(panel, text='保存当前文件配置', command=self.save_config,
                    bootstyle='success-outline').grid(row=4, column=0, sticky='ew',
                                                      pady=(6, 0))
-        ttk.Button(left_frame, text='显示图表窗口', command=self._open_plot_window,
+        ttk.Button(panel, text='显示图表窗口', command=self._open_plot_window,
                    bootstyle='info-outline').grid(row=5, column=0, sticky='ew',
                                                   pady=(6, 0))
 
@@ -206,7 +322,8 @@ class SParamPowerSumApp:
         table_group.pack(fill='both', expand=True)
 
         self.table_msg_var = ttk.StringVar(
-            value='▶ 差分模式：Victim 必须勾选 2 个；攻击端口必须成对(偶数)勾选。')
+            value='▶ 差分模式：Victim 必须勾选 2 个；攻击端口必须成对勾选'
+                  '（对子按左侧「排列方式」划分）。')
         ttk.Label(table_group, textvariable=self.table_msg_var,
                   font=('TkDefaultFont', 9, 'bold'),
                   foreground='#cc4d1a').pack(fill='x', pady=(0, 5), anchor='w')
@@ -226,6 +343,13 @@ class SParamPowerSumApp:
         ttk.Checkbutton(sel_frame, text='全选 NEXT', variable=self.chk_all_n_var,
                         command=lambda: self.toggle_all_column(2, self.chk_all_n_var.get())
                         ).pack(side='left', padx=5)
+        ttk.Label(sel_frame, text='端口名对齐:').pack(side='left', padx=(15, 3))
+        align_combo = ttk.Combobox(sel_frame, textvariable=self.name_align_var,
+                                   state='readonly', width=4,
+                                   values=['左', '居中', '右'])
+        align_combo.pack(side='left')
+        align_combo.bind('<<ComboboxSelected>>',
+                         lambda e: self._apply_name_align())
 
         tree_container = ttk.Frame(table_group)
         tree_container.pack(fill='both', expand=True)
@@ -257,36 +381,58 @@ class SParamPowerSumApp:
         vsb.pack(side='right', fill='y')
         self.tree.bind('<Button-1>', self.on_table_click)
 
+        # ---- 分割条位置自适应左侧内容宽度 ----
+        # ScrolledFrame 会把内容宽度钉死在视口宽度上, 因此先量出左栏
+        # 各分组的自然请求宽度, 视口取最宽分组 (+滚动条余量), 并在
+        # 首次布局后显式放置分割条, 避免每次启动手动调整。
+        try:
+            inner = panel._canvas.winfo_children()[0]
+            inner.update_idletasks()
+            groups = inner.winfo_children()
+            needed = max(c.winfo_reqwidth() for c in groups) + 24
+            panel._canvas.configure(width=needed)
+            self.root.after_idle(
+                lambda: main_paned.sashpos(0, needed + 44))
+        except (AttributeError, IndexError, tk.TclError):
+            pass
+
     # -------------------- 独立图表窗口 --------------------
 
     def _open_plot_window(self):
         """创建或聚焦独立图表窗口 (主窗口与图表窗口一一对应)。
 
-        已存在时仅置顶聚焦, 不会新建第二个; 被用户关闭后可经
-        「显示图表窗口」按钮或本方法重新打开。
+        已存在时置顶聚焦并重算刷新, 不会新建第二个; 被用户关闭后可经
+        「显示图表窗口」按钮或本方法重新打开。每次打开/聚焦都重新
+        计算, 保证展示的不是旧结果。
         """
         if self.plot_window is not None:
             if self.plot_window.winfo_exists():
                 self.plot_window.lift()
                 self.plot_window.focus_force()
+                if self.file_loaded:
+                    self.auto_calculate()
                 return
             self.plot_window = None
 
         win = ttk.Toplevel(self.root)
-        win.title('S参数曲线图')
+        win.title('计算结果')
         self.plot_window = win
 
         # 默认停靠在主窗口右侧
         self.root.update_idletasks()
         x = self.root.winfo_rootx() + self.root.winfo_width() + 10
         y = self.root.winfo_rooty()
-        win.geometry(f'860x520+{max(x, 0)}+{max(y, 0)}')
-        win.minsize(500, 320)
+        win.geometry(f'860x640+{max(x, 0)}+{max(y, 0)}')
+        win.minsize(500, 460)
 
         self._build_plot_window_content(win)
 
         # 用户主动关闭图表窗口: 只关图表, 不影响主窗口
         win.protocol('WM_DELETE_WINDOW', self._on_plot_window_close)
+
+        # 打开后重新计算刷新 (不展示旧结果)
+        if self.file_loaded:
+            self.auto_calculate()
 
     def _build_plot_window_content(self, win):
         """在独立窗口内构建工具行 (曲线开关 + Mark Freq) 与绘图区。"""
@@ -294,11 +440,11 @@ class SParamPowerSumApp:
         toolbar.pack(fill='x')
         ttk.Label(toolbar, text='曲线:').pack(side='left', padx=(0, 4))
         ttk.Checkbutton(toolbar, text='PSFEXT', variable=self.chk_fext_var,
-                        command=self.draw_curves).pack(side='left', padx=3)
+                        command=self._on_curve_toggle).pack(side='left', padx=3)
         ttk.Checkbutton(toolbar, text='PSNEXT', variable=self.chk_next_var,
-                        command=self.draw_curves).pack(side='left', padx=3)
+                        command=self._on_curve_toggle).pack(side='left', padx=3)
         ttk.Checkbutton(toolbar, text='PSXT', variable=self.chk_psxt_var,
-                        command=self.draw_curves).pack(side='left', padx=3)
+                        command=self._on_curve_toggle).pack(side='left', padx=3)
         ttk.Separator(toolbar, orient='vertical').pack(side='left', fill='y', padx=10)
         ttk.Label(toolbar, text='Mark Freq (上限 GHz):').pack(side='left')
         ttk.Entry(toolbar, textvariable=self.mark_freq_var, width=10).pack(
@@ -332,6 +478,110 @@ class SParamPowerSumApp:
             ttk.Label(self.plot_frame, text=f'图表初始化失败: {e}',
                       bootstyle='danger').pack(expand=True)
 
+        # ---- 计算数据区: 曲线图下方, 1 行表格 ----
+        # 列 = 勾选曲线的 Mark 峰值 (PSFEXT/PSNEXT/PSXT, dB)
+        #       + ICN 开关打开时的 6 个 ICN/ccICN 结果 (mV);
+        # 复制按钮在表格上方; 单元格用只读 Entry (tk): 文本可自由框选复制
+        res_frame = ttk.LabelFrame(win, text='计算数据', padding=(8, 4))
+        res_frame.pack(fill='x', padx=8, pady=(0, 8))
+        ttk.Button(res_frame, text='复制表格', width=10,
+                   bootstyle='secondary-outline',
+                   command=self._copy_data_table).pack(anchor='e', pady=(0, 4))
+        # 表格外框容器: highlightthickness 提供明显外框线,
+        # 各单元格 relief='solid' 提供内框线
+        self._table_outer = tk.Frame(res_frame, bg='white',
+                                     highlightbackground='#5a5a5a',
+                                     highlightcolor='#5a5a5a',
+                                     highlightthickness=1, bd=0)
+        self._table_outer.pack(fill='x')
+        self._refresh_data_table()
+
+    # -------------------- 「计算数据」表格 --------------------
+
+    def _data_table_columns(self):
+        """当前应显示的数据列: [(列名, 单位)]。
+
+        左侧 3 列为勾选曲线的 Mark 峰值 (dB), 未勾选的曲线不显示;
+        右侧 6 列为 ICN/ccICN 结果 (mV), 主界面 ICN 开关关闭时不显示。
+        """
+        cols = []
+        for name, chk in (('PSFEXT', self.chk_fext_var),
+                          ('PSNEXT', self.chk_next_var),
+                          ('PSXT', self.chk_psxt_var)):
+            if chk.get():
+                cols.append((name, 'dB'))
+        if self.icn_enabled_var.get():
+            cols.extend((name, 'mV') for name in
+                        ('ICN_n', 'ICN_f', 'ICN', 'ccICN_n', 'ccICN_f', 'ccICN'))
+        return cols
+
+    def _refresh_data_table(self):
+        """重建/刷新「计算数据」表格 (列结构变化时重建, 否则只更新数值)。"""
+        outer = self._table_outer
+        if outer is None or not outer.winfo_exists():
+            self.data_table_vars = {}
+            self._data_table_cols = None
+            return
+
+        cols = self._data_table_columns()
+        if tuple(cols) != self._data_table_cols:
+            for w in outer.winfo_children():
+                w.destroy()
+            self.data_table_vars = {}
+            self._data_table_cols = tuple(cols)
+            if not cols:
+                ttk.Label(outer,
+                          text='(无可显示的数据列: 请勾选曲线或打开 ICN 开关)',
+                          font=('TkDefaultFont', 8)).pack(padx=4, pady=2)
+            else:
+                for col, (name, unit) in enumerate(cols):
+                    tk.Label(outer, text=f'{name} ({unit})',
+                             font=('TkDefaultFont', 9, 'bold'),
+                             bg='#e9ecef', relief='solid', bd=1).grid(
+                        row=0, column=col, sticky='nsew')
+                    var = ttk.StringVar(value='--')
+                    self.data_table_vars[name] = var
+                    tk.Entry(outer, textvariable=var, state='readonly',
+                             font=('Consolas', 9), relief='solid', bd=1,
+                             readonlybackground='white', justify='center'
+                             ).grid(row=1, column=col, sticky='nsew')
+                    outer.columnconfigure(col, weight=1, uniform='dt')
+
+        marks = self._last_mark_peaks
+        res = self._last_icn_results
+        for name, unit in cols:
+            var = self.data_table_vars.get(name)
+            if var is None:
+                continue
+            if unit == 'dB':
+                point = marks.get(name)
+                var.set(f'{point[1]:.2f}' if point is not None else '--')
+            else:
+                var.set(f'{res[name.lower()] * 1e3:.6g}' if res else '--')
+
+    def _copy_data_table(self):
+        """复制整表 (表头含单位 + 1 行数值, 制表符分隔), 可直接粘贴进 Excel。"""
+        cols = self._data_table_columns()
+        if not cols or not self.data_table_vars or self.plot_window is None:
+            return
+        header = '\t'.join(f'{name} ({unit})' for name, unit in cols)
+        values = '\t'.join(self.data_table_vars[name].get() for name, _ in cols)
+        self.plot_window.clipboard_clear()
+        self.plot_window.clipboard_append(f'{header}\n{values}')
+        self._set_status('状态: 计算数据已复制到剪贴板 (可直接粘贴进 Excel)')
+
+    def _on_curve_toggle(self):
+        """曲线勾选变化: 重绘曲线并同步「计算数据」表格的 Mark 列显隐。"""
+        self.draw_curves()
+        self._refresh_data_table()
+
+    def _on_icn_toggle(self):
+        """ICN 开关变化: 重算 (含表格列显隐), 未加载文件时只刷新表格。"""
+        if self.file_loaded:
+            self.auto_calculate()
+        else:
+            self._refresh_data_table()
+
     def _on_plot_window_close(self):
         """销毁图表窗口并复位绘图引用 (可由用户关闭或主窗口关闭触发)。"""
         if self.plot_window is not None:
@@ -343,6 +593,9 @@ class SParamPowerSumApp:
         self.fig = None
         self.ax = None
         self.canvas_mpl = None
+        self.data_table_vars = {}
+        self._data_table_cols = None
+        self._table_outer = None
 
     def _on_main_window_close(self):
         """主窗口关闭时连带关闭图表窗口。"""
@@ -414,9 +667,19 @@ class SParamPowerSumApp:
 
         self.tree.column('Port', width=max_port_width + 40, anchor='center',
                          stretch=False)
-        self.tree.column('Name', width=max_name_width + 40, anchor='w', stretch=True)
+        self.tree.column('Name', width=max_name_width + 40,
+                         anchor=self._name_anchor(), stretch=True)
 
         self.sync_table_ui()
+
+    _NAME_ANCHORS = {'左': 'w', '居中': 'center', '右': 'e'}
+
+    def _name_anchor(self):
+        return self._NAME_ANCHORS.get(self.name_align_var.get(), 'w')
+
+    def _apply_name_align(self):
+        """应用端口名对齐方式到表格列。"""
+        self.tree.column('Name', anchor=self._name_anchor())
 
     def sync_table_ui(self):
         """同步 BooleanVar 状态到 Treeview 的显示文本与行高亮"""
@@ -529,14 +792,10 @@ class SParamPowerSumApp:
                 return port + N // 2 if port <= N // 2 else port - N // 2
             return port + 1 if port % 2 == 1 else port - 1
 
+        # 差分对子划分与计算端共用 sparam_core.diff_pair,
+        # 保证自动勾选的配对与功率和计算的配对永远一致
         def get_pair(port):
-            if arrange == 'Type1':
-                return (port, port + 1) if port % 2 == 1 else (port - 1, port)
-            if is_side_a(port):
-                idx = (port - 1) // 4
-                return (4 * idx + 1, 4 * idx + 3)
-            idx = (port - 2) // 4
-            return (4 * idx + 2, 4 * idx + 4)
+            return diff_pair(port, N, arrange)
 
         if target_port is None:
             v_ports, _, _ = self._get_selected_ports()
@@ -612,7 +871,8 @@ class SParamPowerSumApp:
 
     def mode_changed(self):
         if self.mode_var.get() == self.DIFF_MODE:
-            self.table_msg_var.set('▶ 差分模式：Victim 必须勾选 2 个；攻击端口必须成对(偶数)勾选。')
+            self.table_msg_var.set('▶ 差分模式：Victim 必须勾选 2 个；攻击端口必须成对勾选'
+                                   '（对子按左侧「排列方式」划分）。')
         else:
             self.table_msg_var.set('▶ 单端模式：Victim 仅需勾选 1 个；攻击端口可任意数量(奇/偶)勾选。')
         self._refresh_selection()
@@ -640,12 +900,16 @@ class SParamPowerSumApp:
 
             self.file_z0_var.set(f'文件原始阻抗: {self.spara_obj.z0:g} Ω')
 
+            self._sparam_cache = None  # 新文件: 旧重采样缓存作废
+
             if len(freqs) > 1:
                 with self._paused():
-                    self.fmin_var.set(round(freqs[0] / 1e9, 6))
-                    self.fmax_var.set(round(freqs[-1] / 1e9, 6))
+                    # 界面频率输入单位为 Hz, 科学计数法显示;
+                    # fstep 默认取文件原始频点间隔, 可手动修改
+                    self.fmin_var.set(f'{freqs[0]:.6g}')
+                    self.fmax_var.set(f'{freqs[-1]:.6g}')
                     self.fstep_var.set(
-                        round((freqs[-1] - freqs[0]) / (len(freqs) - 1) / 1e9, 6))
+                        f'{(freqs[-1] - freqs[0]) / (len(freqs) - 1):.6g}')
 
             self._build_port_table(num_ports, self.spara_obj.port_names)
 
@@ -681,6 +945,10 @@ class SParamPowerSumApp:
         if self._suppress_auto or not self.file_loaded:
             return
 
+        # 重新计算前的中间状态: 清空结果区, 计算成功后再刷新
+        self._last_icn_results = None
+        self._refresh_data_table()
+
         v_ports, f_ports, n_ports = self._get_selected_ports()
         is_diff = (self.mode_var.get() == self.DIFF_MODE)
 
@@ -694,6 +962,24 @@ class SParamPowerSumApp:
             if len(f_ports) % 2 != 0 or len(n_ports) % 2 != 0:
                 self._set_status('状态: 差分模式下，攻击端口数量必须是偶数对！', 'error')
                 return
+            # 按 DUT 引脚排列 (排列方式) 校验对子完整性并重排端口,
+            # 使列表中相邻两个端口恰为一对 —— power_sum_db 按此约定配对。
+            # 仅校验偶数不够: 两个"半对"(如勾选 1,4) 总数也是偶数,
+            # 会被静默错配, 必须逐端口核对配对端口是否同列勾选。
+            arrange = self.arrange_var.get()
+            N = len(self.port_vars)
+            broken = (find_broken_pairs(f_ports, N, arrange)
+                      + find_broken_pairs(n_ports, N, arrange))
+            if broken:
+                arrange_name = '排列一' if arrange == 'Type1' else '排列二'
+                self._set_status(
+                    f'状态: 差分对子不完整！端口 {broken} 的配对端口未同列勾选'
+                    f'（对子按{arrange_name}划分）。',
+                    'error')
+                return
+            f_ports = order_ports_by_pairs(f_ports, N, arrange)
+            n_ports = order_ports_by_pairs(n_ports, N, arrange)
+            v_ports = order_ports_by_pairs(v_ports, N, arrange)
         else:
             if len(v_ports) != 1:
                 self._set_status('状态: 单端模式下，Victim 必须勾选且仅能勾选 1 个！', 'warn')
@@ -701,16 +987,15 @@ class SParamPowerSumApp:
 
         try:
             z0 = self.z0_var.get()
-            fmin = self.fmin_var.get()
-            fmax = self.fmax_var.get()
-            fstep = self.fstep_var.get()
-        except tk.TclError:
+            # 界面输入单位为 Hz (科学计数法/表达式), 重算时求值,
+            # 重采样缓存内部使用 GHz
+            fmin = float(evaluate_expr(self.fmin_var.get())) / 1e9
+            fmax = float(evaluate_expr(self.fmax_var.get())) / 1e9
+            fstep = float(evaluate_expr(self.fstep_var.get())) / 1e9
+        except (ValueError, tk.TclError):
             self._set_status('状态: 输入参数无效！', 'error')
             return
 
-        if fstep <= 0:
-            self._set_status('状态: 频率步进必须大于 0！', 'error')
-            return
         if fmin > fmax:
             self._set_status('状态: 最小频率不能大于最大频率！', 'error')
             return
@@ -720,26 +1005,193 @@ class SParamPowerSumApp:
         if fmin < 0:
             self._set_status('状态: 频率下限不能为负数！', 'error')
             return
+        if fstep <= 0:
+            self._set_status('状态: 频率步长必须大于 0！', 'error')
+            return
         num_points = int(round((fmax - fmin) / fstep)) + 1
         if num_points > 500_000:
             self._set_status(
-                f'状态: 频率点数过多 ({num_points} > 500000)！'
-                '请增大步进或缩小频率范围。', 'error')
+                f'状态: 频率点数过多（{num_points} 个）！请增大步长或缩小范围。',
+                'error')
             return
 
         self._set_status('状态: 正在计算并绘制曲线...', 'info')
         self.root.update_idletasks()
 
+        # 重采样缓存: 基本参数 (z0/fmin/fmax/fstep) 任一变化即整体重建;
+        # 端口勾选/公式/绘图开关变化时直接复用缓存, 避免重复插值。
+        # 缓存的是"归一化 + 插值后"的数据副本, 原始 spara_obj 不被修改。
         try:
+            key = (z0, fmin, fmax, fstep)
+            cache = self._sparam_cache
+            if cache is None or cache[0] != key:
+                params, freqs = resample_sparams(
+                    self.spara_obj, z0, fmin, fmax, fstep)
+                cache = (key, types.SimpleNamespace(
+                    parameters=params, frequencies=freqs,
+                    z0=z0, num_ports=params.shape[0]))
+                self._sparam_cache = cache
             self.plot_data = power_sum_db(
-                self.spara_obj, z0, v_ports, f_ports, n_ports, is_diff,
-                fmin, fmax, fstep)
+                cache[1], z0, v_ports, f_ports, n_ports, is_diff,
+                fmin, fmax, formulas=self._current_formulas())
         except (ValueError, np.linalg.LinAlgError, ZeroDivisionError) as e:
             self._set_status(f'状态: 计算失败！{e}', 'error')
             return
 
-        self._set_status('状态: 计算完成！参数修改可实时重算重绘。', 'success')
+        # 差分模式回显实际参与计算的端口对子, 便于核对配对是否符合预期
+        if is_diff:
+            def pair_text(ports):
+                return ' '.join(
+                    f'({ports[i]},{ports[i + 1]})'
+                    for i in range(0, len(ports), 2)) or '无'
+            self._set_status(
+                f'状态: 计算完成！Victim 对 {tuple(v_ports)}；'
+                f'NEXT 对: {pair_text(n_ports)}；FEXT 对: {pair_text(f_ports)}',
+                'success')
+        else:
+            self._set_status('状态: 计算完成！参数修改可实时重算重绘。', 'success')
+        self._update_icn_results()
         self.draw_curves()
+
+    # -------------------- ICN / ccICN 计算与公式编辑 --------------------
+
+    def _eval_icn_scalars(self):
+        """求值 8 个标量输入框 (支持表达式/科学计数法, 不做四舍五入)。
+
+        返回 (scalars dict, 错误信息); scalars 以公式环境名
+        (Ant/Aft/fb/Tnt/Tft/PAM/ILn/ILf) 为键, 成功时错误信息为 None。
+        """
+        scalars = {}
+        for key, var in self.icn_scalar_vars.items():
+            env_name = self._ICN_SCALAR_ENV[key]
+            try:
+                scalars[env_name] = float(evaluate_expr(var.get()))
+            except ValueError as e:
+                return None, f'{env_name}: {e}'
+        return scalars, None
+
+    def _current_formulas(self):
+        return {key: var.get() for key, var in self.formula_vars.items()}
+
+    def _toggle_formula_edit(self, key):
+        """公式编辑/完成按钮切换。同一时间只允许编辑一条公式。"""
+        entry, btn = self.formula_widgets[key]
+        if self._formula_editing is None:
+            self._formula_editing = key
+            entry.config(state='normal')
+            btn.config(text='完成', bootstyle='success-outline')
+            entry.focus_set()
+            self._set_status(f'状态: 正在编辑公式 [{key}]，点击「完成」校验并生效。',
+                             'info')
+        elif self._formula_editing == key:
+            err = self._validate_formulas()
+            if err:
+                ttk.Messagebox.show_error('公式校验失败', err)
+                return
+            self._formula_editing = None
+            entry.config(state='readonly')
+            btn.config(text='编辑', bootstyle='secondary-outline')
+            self._set_status(f'状态: 公式 [{key}] 已更新，计算沿用新公式。', 'success')
+            self._schedule_recalculate()
+        else:
+            self._set_status(
+                f'状态: 请先点击「完成」结束公式 [{self._formula_editing}] 的编辑。',
+                'warn')
+
+    def _validate_formulas(self):
+        """用合成环境 (不依赖已加载文件) 试算全部公式。
+
+        返回错误信息字符串; 全部通过返回 None。
+        """
+        scalars, err = self._eval_icn_scalars()
+        if err:
+            return f'输入变量错误: {err}'
+        try:
+            fstep_hz = float(evaluate_expr(self.fstep_var.get()))
+        except (ValueError, tk.TclError) as e:
+            return f'fstep: {e}'
+        if fstep_hz <= 0:
+            return 'fstep 必须大于 0'
+        scalars['fstep'] = fstep_hz
+        fn = np.linspace(1e6, 1e10, 8)
+        ones = np.ones_like(fn)
+        formulas = self._current_formulas()
+        try:
+            icn_calculate(fn, ones, ones, scalars, formulas)
+        except ValueError as e:
+            return str(e)
+
+        # FEXT_dB/NEXT_dB/PSFEXT/PSNEXT/PSXT 在 power_sum_db 中求值,
+        # 这里用合成 (2 条路径 x 8 频点) 二维 dB 矩阵单独校验
+        env = {'RAW_FEXT_dB': np.tile(-fn / 1e10, (2, 1)),
+               'RAW_NEXT_dB': np.tile(-2 * fn / 1e10, (2, 1))}
+        for name in ('FEXT_dB', 'NEXT_dB'):
+            raw = env['RAW_' + name]
+            try:
+                arr = np.asarray(evaluate_expr(formulas[name], env),
+                                 dtype=float)
+            except ValueError as e:
+                return f'公式 {name}: {e}'
+            if arr.shape != raw.shape:
+                return (f'公式 {name}: 结果形状 {arr.shape} 与 '
+                        f'RAW_{name} {raw.shape} 不一致')
+            env[name] = arr
+        for name in ('PSFEXT', 'PSNEXT', 'PSXT'):
+            try:
+                arr = np.asarray(evaluate_expr(formulas[name], env),
+                                 dtype=float)
+            except ValueError as e:
+                return f'公式 {name}: {e}'
+            if arr.shape != fn.shape:
+                return (f'公式 {name}: 结果形状 {arr.shape} '
+                        f'与频点 {fn.shape} 不一致')
+            env[name] = np.where(np.isfinite(arr), arr, -100.0)
+        return None
+
+    def _fail_icn(self, message):
+        """ICN 计算失败: 置空结果并在状态栏提示, 不阻塞功率和曲线。"""
+        self._last_icn_results = None
+        self._refresh_data_table()
+        self._set_status(f'状态: ICN/ccICN 计算失败 ({message})', 'warn')
+
+    def _update_icn_results(self):
+        """基于最近一次功率和结果计算 ICN / ccICN 并刷新结果区。
+
+        主界面 ICN 开关关闭时跳过计算; ICN 参数/公式无效时不阻塞
+        功率和曲线 (保持既有行为), 仅在状态栏提示。
+        """
+        if not self.icn_enabled_var.get():
+            self._last_icn_results = None
+            self._refresh_data_table()
+            return
+        if not self.plot_data:
+            return
+        scalars, err = self._eval_icn_scalars()
+        if err:
+            self._fail_icn(f'输入变量错误 {err}')
+            return
+        try:
+            fstep_hz = float(evaluate_expr(self.fstep_var.get()))
+        except (ValueError, tk.TclError):
+            self._fail_icn('fstep 无效')
+            return
+        if fstep_hz <= 0:
+            self._fail_icn('fstep 必须大于 0')
+            return
+        scalars['fstep'] = fstep_hz
+
+        try:
+            result = icn_calculate(
+                self.plot_data['fn_hz'],
+                self.plot_data['fext_power_lin'],
+                self.plot_data['next_power_lin'],
+                scalars, self._current_formulas())
+        except ValueError as e:
+            self._fail_icn(str(e))
+            return
+
+        self._last_icn_results = result
+        self._refresh_data_table()
 
     # -------------------- 绘制曲线 --------------------
 
@@ -747,6 +1199,8 @@ class SParamPowerSumApp:
         if self._redraw_job is not None:
             self.root.after_cancel(self._redraw_job)
             self._redraw_job = None
+        # Mark 峰值随每次重绘重新计算 (先清空, 标注时逐条填入)
+        self._last_mark_peaks = {}
         if not self.plot_data or self.ax is None:
             return
 
@@ -773,6 +1227,7 @@ class SParamPowerSumApp:
         self.ax.tick_params(labelsize=9)
         self.fig.tight_layout()
         self.canvas_mpl.draw()
+        self._refresh_data_table()
 
     def _annotate_mark_peak(self, data):
         """在 Mark Freq 上限之前为各条可见曲线标注峰值。"""
@@ -791,18 +1246,19 @@ class SParamPowerSumApp:
         m_idx = int(np.argmin(np.abs(data['fn_ghz'] - mark_target))) + 1
 
         series = (
-            ('MDFEXT', 'has_fext', self.chk_fext_var, '#D95319'),
-            ('MDNEXT', 'has_next', self.chk_next_var, '#0072BD'),
-            ('PSXT', None, self.chk_psxt_var, '#77AC30'),
+            ('PSFEXT', 'MDFEXT', 'has_fext', self.chk_fext_var, '#D95319'),
+            ('PSNEXT', 'MDNEXT', 'has_next', self.chk_next_var, '#0072BD'),
+            ('PSXT', 'PSXT', None, self.chk_psxt_var, '#77AC30'),
         )
         points = []
-        for key, flag, chk, color in series:
+        for name, key, flag, chk, color in series:
             if not chk.get():
                 continue
             if flag is not None and not data[flag]:
                 continue
             seg = data[key][:m_idx]
             idx = int(np.argmax(seg))
+            self._last_mark_peaks[name] = (data['fn_ghz'][idx], seg[idx])
             points.append((data['fn_ghz'][idx], seg[idx], color))
         if not points:
             return
