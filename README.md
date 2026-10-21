@@ -4,7 +4,8 @@
 
 典型场景：DDR/LPDDR 等并行总线的布线串扰评估——从仿真工具（HFSS / SIwave / Cadence 等）导出多端口 S 参数，勾选受害线（Victim）与攻击线（Aggressor），即可得到各频段的总串扰包络曲线与 ICN/ccICN 数值，用于对比不同布线方案的串扰裕量。
 
-<img width="2291" height="932" alt="image" src="https://github.com/user-attachments/assets/30d8889a-cae6-4a07-a0ff-9d774d4b6293" />
+<img width="2291" height="932" alt="image" src="https://github.com/user-attachments/assets/dafe5d57-0d34-4c8a-94f2-606b547fd176" />
+
 
 
 ## 功能特性
