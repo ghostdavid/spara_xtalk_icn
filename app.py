@@ -1,21 +1,34 @@
 """S参数串扰计算工具 —— GUI 主程序 (ttkbootstrap)。
 
-布局:
-- 主窗口左栏: 「S参数文件」「计算参数」「端口自动勾选」三个分组
-  + 保存配置 / 显示图表窗口按钮
-- 主窗口右栏: 端口勾选映射表
-- 独立图表窗口 (Toplevel): 画布上方工具行 (曲线开关 + Mark Freq),
-  启动时自动弹出; 用户主动关闭不影响主窗口, 可经按钮重新打开;
-  主窗口关闭时连带关闭; 主窗口与图表窗口一一对应
-- 主窗口底部: 全宽状态栏 (info/success/warn/error 四色语义)
+布局 (单窗口三栏, 启动即最大化 (非全屏)):
+- 左栏「设置与操作」: 「S参数导入」「基本设置」「ICN计算」「界面设置」
+  四个分组, 宽度随内容自适应, 可拖动分割条调整;
+- 中栏「计算结果」: 曲线操作栏 (曲线开关 + Mark Freq + 曲线字体滑块)
+  在上; 曲线图与「计算数据」表格垂直分割, 分割线可上下拖动
+  (计算数据区默认高度占整个窗口 1/3);
+  曲线图始终保持 16:10 比例, 区域大小变化时在可用空间内居中自适应;
+- 右栏「端口勾选」: 「端口自动勾选」分组 + 端口勾选表 (真实勾选框,
+  列序 Port/端口名/Victim/FEXT/NEXT, 端口名默认右对齐,
+  栏宽随端口名文字长度自适应; 勾选行按角色变色: Victim 蓝 /
+  FEXT 红 / NEXT 绿, 只改颜色不改字体), 可拖动分割条调整;
+- 全局字体体系: 全部控件使用全局/命名字体, 左栏「界面设置」的
+  全局字体下拉框即时生效; 字号基准以 2K 27 英寸屏为准;
+- 底部: 全宽状态栏 (info/success/warn/error 四色语义)。
+
+「批量导出」独立窗口: 逐次缓存主界面当前计算数据
+(单端端口一行; 差分端口也是一行, 两个端口在 Port/端口名列
+以 / 合并), 可导出 CSV (utf-8-sig, 默认保存路径为 S 参数所在目录)
+或整体清空; 随主窗口关闭而关闭, 自身关闭不影响主窗口。
 
 行为与 V3.3 保持一致, 重构点:
 - 输入 (Z0/频率/Mark) 采用 300ms 级防抖, 避免每次按键全量重算;
-- 配置恢复/保存统一走 _SCALAR_FIELDS/_PORT_FIELDS 映射表;
+- 配置恢复/保存统一走 _SCALAR_FIELDS/_PORT_FIELDS 映射表,
+  旧配置中 PSXT 改名前的遗留键经 _LEGACY_SCALAR_ALIAS 兼容读取;
 - 默认配置文件固定在 exe (打包) 或脚本 (源码) 所在目录, 不再依赖 CWD。
 """
 
 import contextlib
+import csv
 import json
 import sys
 import tkinter as tk
@@ -59,12 +72,19 @@ class SParamPowerSumApp:
         ('fmax', 'fmax_var'), ('fstep', 'fstep_var'),
         ('name_align', 'name_align_var'),
         ('mark_freq', 'mark_freq_var'), ('chk_fext', 'chk_fext_var'),
-        ('chk_next', 'chk_next_var'), ('chk_psxt', 'chk_psxt_var'),
+        ('chk_next', 'chk_next_var'), ('chk_psxtlk', 'chk_psxtlk_var'),
         ('auto_select', 'auto_select_var'), ('arrange', 'arrange_var'),
         ('icn_enabled', 'icn_enabled_var'),
+        ('font_size', 'font_size_var'), ('plot_font', 'plot_font_var'),
     ) + tuple((key, key + '_var') for key, _ in _ICN_SCALAR_DEFAULTS) \
       + tuple(('formula_' + key, 'formula_var_' + key)
               for key in DEFAULT_FORMULAS)
+    # 旧版本配置遗留键 (PSXT 改名 PSXTLK 之前) -> 新变量属性名,
+    # 仅在新键缺失时补读, 保证旧配置文件不丢失勾选/公式设置
+    _LEGACY_SCALAR_ALIAS = {
+        'chk_psxt': 'chk_psxtlk_var',
+        'formula_PSXT': 'formula_var_PSXTLK',
+    }
     # 端口勾选: (JSON 键, port_vars 元组中的下标)
     _PORT_FIELDS = (
         ('v_ports', 0), ('f_ports', 1), ('n_ports', 2),
@@ -79,6 +99,10 @@ class SParamPowerSumApp:
     _RECALC_DELAY_MS = 350
     _REDRAW_DELAY_MS = 250
 
+    # ICN 显示单位 → 缩放倍数 (与 _icn_display 口径一致, 纯 10 的幂次换算)
+    _BATCH_UNIT_SCALE = {'V': 1.0, 'mV': 1e3, 'µV': 1e6, 'nV': 1e9,
+                         'pV': 1e12}
+
     def __init__(self, root):
         self.root = root
         self.root.title('S参数串扰计算')
@@ -90,7 +114,7 @@ class SParamPowerSumApp:
         self.plot_data = {}
         self.filepath = ''
         self.port_vars = []
-        self.port_items = {}
+        self._port_rows = []        # [((v_cb, f_cb, n_cb), port_label, name_label)]
         self._suppress_auto = 0
         self._recalc_job = None
         self._redraw_job = None
@@ -102,7 +126,13 @@ class SParamPowerSumApp:
         self.fig = None
         self.ax = None
         self.canvas_mpl = None
-        self.plot_window = None
+
+        # 「批量导出」窗口状态: 窗口引用、列表 Treeview、缓存行
+        # (行 = {'Port': str, '端口名': str, '_vals': {列名: float|None}},
+        #  _vals 存原始计算值, 展示时按主表当前单位实时换算)
+        self.batch_window = None
+        self._batch_tree = None
+        self._batch_rows = []
 
         # ICN / ccICN 状态: 启用开关、最近一次计算结果、当前正在编辑的
         # 公式键 (同一时间只允许编辑一条)
@@ -116,65 +146,172 @@ class SParamPowerSumApp:
         self._table_outer = None
         self._last_mark_peaks = {}
 
-        # 曲线开关与 Mark Freq 变量在主窗口构建前创建 (配置恢复依赖它们);
-        # mark_freq 的防抖重绘 trace 只注册一次, 避免图表窗口重开时重复注册
+        # 曲线开关与 Mark Freq 变量在主界面构建前创建 (配置恢复依赖它们);
+        # mark_freq 的防抖重绘 trace 只注册一次
         self.chk_fext_var = ttk.BooleanVar(value=True)
         self.chk_next_var = ttk.BooleanVar(value=True)
-        self.chk_psxt_var = ttk.BooleanVar(value=True)
+        self.chk_psxtlk_var = ttk.BooleanVar(value=True)
         self.mark_freq_var = ttk.StringVar(value='')
         self.mark_freq_var.trace_add('write', lambda *_: self._schedule_redraw())
-        # 端口名对齐方式: 左 / 居中 / 右
-        self.name_align_var = ttk.StringVar(value='左')
+        # 端口名对齐方式: 左 / 居中 / 右 (默认右对齐)
+        self.name_align_var = ttk.StringVar(value='右')
+        # 曲线图 16:10 比例自适应的防抖任务
+        self._plot_fit_job = None
 
         self._build_ui()
         self._load_last_config()
 
-        # 主窗口关闭时连带关闭图表窗口
+        # 主窗口关闭时连带关闭「批量导出」窗口
         self.root.protocol('WM_DELETE_WINDOW', self._on_main_window_close)
-        # 启动后异步弹出独立图表窗口
-        self.root.after(100, self._open_plot_window)
+        # 窗口映射后按内容自适应左右栏默认宽度
+        self.root.after(150, self._layout_initial_sashes)
 
     # -------------------- 窗口与样式 --------------------
 
     def _setup_scaling(self):
-        """根据屏幕分辨率计算合适的字体与窗口大小"""
+        """启动即最大化 (非全屏), 并建立全局字体体系。
+
+        字号基准以 2K 27 英寸屏 (2560 宽) 为准: 默认 11, 小屏降到 10;
+        全部控件使用命名/全局字体, 「界面设置」下拉框调整时即时全局生效。
+        曲线图字体独立由工具栏滑块控制 (plot_font_var)。
+        """
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
 
-        win_w = max(900, min(int(sw * 0.65), 1400))
-        win_h = max(680, min(int(sh * 0.7), 900))
-        x = (sw - win_w) // 2
-        y = (sh - win_h) // 2
-        self.root.geometry(f'{win_w}x{win_h}+{max(x, 0)}+{max(y, 0)}')
-        self.root.minsize(900, 680)
+        try:
+            self.root.state('zoomed')      # Windows: 最大化 (保留标题栏/任务栏)
+        except tk.TclError:
+            # 不支持 zoomed 的平台用接近满屏的 geometry 兜底
+            self.root.geometry(
+                f'{int(sw * 0.94)}x{int(sh * 0.92)}+{int(sw * 0.03)}+10')
+        self.root.minsize(1100, 700)
 
-        base_size = 9 if sw < 1500 else 10
+        base_size = 10 if sw < 2000 else 11
         self.default_font = tkfont.nametofont('TkDefaultFont')
         self.default_font.configure(size=base_size)
+        for name in ('TkTextFont', 'TkHeadingFont', 'TkMenuFont'):
+            try:
+                tkfont.nametofont(name).configure(size=base_size)
+            except tk.TclError:
+                pass
+
+        # 自定义命名字体: 控件按用途引用, 全局调整时统一 reconfigure
+        fam = self.default_font.actual('family')
+        self._font_bold = self._named_font(
+            'AppBold', family=fam, size=base_size, weight='bold')
+        self._font_small = self._named_font(
+            'AppSmall', family=fam, size=base_size - 1)
+        self._font_mono = self._named_font(
+            'AppMono', family='Consolas', size=base_size - 1)
+        self._font_mono_lg = self._named_font(
+            'AppMonoLg', family='Consolas', size=base_size)
+        self._font_mono_small = self._named_font(
+            'AppMonoSmall', family='Consolas', size=base_size - 2)
+
+        # 全局字体大小 (下拉框, 见左栏「界面设置」) 与曲线图字号 (工具栏滑块)
+        self.font_size_var = ttk.StringVar(value=str(base_size))
+        self.font_size_var.trace_add('write', self._apply_font_sizes)
+        self.plot_font_var = ttk.IntVar(value=13)
+        self.plot_font_var.trace_add('write', self._on_plot_font_changed)
+
+    @staticmethod
+    def _named_font(name, **kw):
+        """创建命名全局字体; 同名已存在 (重复实例化) 时改为重配置。"""
+        try:
+            return tkfont.Font(name=name, **kw)
+        except tk.TclError:
+            font = tkfont.nametofont(name)
+            font.configure(**kw)
+            return font
+
+    def _apply_font_sizes(self, *_):
+        """全局字体下拉框变化: 重配置全局/命名字体并重自适应布局。"""
+        try:
+            size = int(float(self.font_size_var.get()))
+        except (ValueError, tk.TclError):
+            return
+        size = max(8, min(16, size))
+        self.default_font.configure(size=size)
+        for name in ('TkTextFont', 'TkHeadingFont', 'TkMenuFont'):
+            try:
+                tkfont.nametofont(name).configure(size=size)
+            except tk.TclError:
+                pass
+        self._font_bold.configure(size=size)
+        self._font_small.configure(size=max(7, size - 1))
+        self._font_mono.configure(size=max(7, size - 1))
+        self._font_mono_lg.configure(size=size)
+        self._font_mono_small.configure(size=max(7, size - 2))
+        ttk.Style().configure('Treeview', rowheight=max(22, int(size * 2.2)))
+        # 字号影响内容宽高, 重新自适应栏宽与计算数据区高度
+        if hasattr(self, '_main_paned'):
+            self.root.after_idle(self._layout_after_font_change)
+
+    def _layout_after_font_change(self):
+        self._sync_port_columns()
+        self._align_port_header()
+        self._layout_initial_sashes()
+        self._adapt_data_area()
+
+    def _on_plot_font_changed(self, *_):
+        """曲线图字号滑块: 更新数值标签并防抖重绘曲线。"""
+        try:
+            value = self.plot_font_var.get()
+        except tk.TclError:
+            return
+        if hasattr(self, '_plot_font_label'):
+            self._plot_font_label.configure(text=str(value))
+        self._schedule_redraw()
+
+    def _plot_fontsize(self):
+        """曲线图基准字号 (坐标轴标题); 刻度/图例/标注按比例递减。"""
+        try:
+            return max(8, min(22, self.plot_font_var.get()))
+        except (tk.TclError, ValueError):
+            return 13
 
     def _build_ui(self):
         # 底部状态栏先布局, 主区域占据其余全部空间
-        status_bar = ttk.Frame(self.root, padding=(10, 2, 10, 6))
+        status_bar = ttk.Frame(self.root, padding=(12, 4, 12, 8))
         status_bar.pack(side='bottom', fill='x')
         self.status_var = ttk.StringVar(value='状态: 请点击左侧按钮导入 S 参数文件')
         self.status_label = ttk.Label(status_bar, textvariable=self.status_var,
-                                      font=('TkDefaultFont', 9, 'bold'))
+                                      font='AppBold')
         self.status_label.pack(side='left')
         ttk.Sizegrip(status_bar).pack(side='right')
 
-        main_paned = ttk.Panedwindow(self.root, orient='horizontal')
-        main_paned.pack(fill='both', expand=True, padx=10, pady=(8, 0))
+        # 端口行角色高亮: 只改颜色, 不改字体/字号
+        # (Victim 蓝 / FEXT 红 / NEXT 绿, 优先级同此顺序)
+        style = ttk.Style()
+        style.configure('Victim.TLabel', foreground='#0b5ed7')
+        style.configure('Fext.TLabel', foreground='#c21f3d')
+        style.configure('Next.TLabel', foreground='#1e7e34')
+        style.configure('Treeview',
+                        rowheight=max(22, int(self.default_font.cget('size')
+                                              * 2.2)))
 
-        # ===== 左侧面板 (内容过长, 用可滚动容器) =====
-        left_frame = ttk.LabelFrame(main_paned, text='设置与操作', padding=10)
-        main_paned.add(left_frame, weight=0)
+        self._main_paned = ttk.Panedwindow(self.root, orient='horizontal')
+        self._main_paned.pack(fill='both', expand=True, padx=12, pady=(10, 0))
+
+        self._build_left_panel()
+        self._build_center_panel()
+        self._build_right_panel()
+
+    # ==================== 左栏: 设置与操作 ====================
+
+    def _build_left_panel(self):
+        left_frame = ttk.LabelFrame(self._main_paned, text='设置与操作',
+                                    padding=10)
+        self._main_paned.add(left_frame, weight=0)
         left_frame.columnconfigure(0, weight=1)
         left_frame.rowconfigure(0, weight=1)
-        panel = ttk.ScrolledFrame(left_frame, autohide=True)
+        panel = ttk.ScrolledFrame(left_frame, autohide=False)
         panel.grid(row=0, column=0, sticky='nsew')
+        self._left_scrolled = panel
 
-        file_group = ttk.LabelFrame(panel, text='S参数文件', padding=8)
-        file_group.grid(row=0, column=0, sticky='ew', pady=(0, 6))
+        # ---- S参数导入: 文件选择 + 保存当前文件配置 ----
+        file_group = ttk.LabelFrame(panel, text='S参数导入', padding=10)
+        file_group.grid(row=0, column=0, sticky='ew', pady=(0, 10))
         file_group.columnconfigure(0, weight=1)
         self.path_btn = ttk.Button(file_group, text='点击此处选择 .sNp 文件...',
                                    command=self.import_s_params,
@@ -182,11 +319,15 @@ class SParamPowerSumApp:
         self.path_btn.grid(row=0, column=0, sticky='ew')
         self.file_z0_var = ttk.StringVar(value='文件原始阻抗: --')
         ttk.Label(file_group, textvariable=self.file_z0_var,
-                  font=('TkDefaultFont', 8)).grid(row=1, column=0, sticky='w',
-                                                  pady=(4, 0))
+                  font='AppSmall').grid(row=1, column=0, sticky='w',
+                                        pady=(6, 0))
+        ttk.Button(file_group, text='保存当前文件配置', command=self.save_config,
+                   bootstyle='success-outline').grid(row=2, column=0,
+                                                     sticky='ew', pady=(10, 0))
 
-        param_group = ttk.LabelFrame(panel, text='基本参数', padding=8)
-        param_group.grid(row=1, column=0, sticky='ew', pady=(0, 6))
+        # ---- 基本设置 ----
+        param_group = ttk.LabelFrame(panel, text='基本设置', padding=10)
+        param_group.grid(row=1, column=0, sticky='ew', pady=(0, 10))
         param_group.columnconfigure(0, weight=1)
 
         ttk.Label(param_group, text='计算模式:').grid(row=0, column=0, sticky='w')
@@ -194,11 +335,11 @@ class SParamPowerSumApp:
         mode_combo = ttk.Combobox(param_group, textvariable=self.mode_var,
                                   state='readonly',
                                   values=[self.DIFF_MODE, self.SE_MODE])
-        mode_combo.grid(row=1, column=0, sticky='ew', pady=(2, 6))
+        mode_combo.grid(row=1, column=0, sticky='ew', pady=(3, 8))
         mode_combo.bind('<<ComboboxSelected>>', lambda e: self.mode_changed())
 
         z0_frame = ttk.Frame(param_group)
-        z0_frame.grid(row=2, column=0, sticky='ew', pady=(0, 6))
+        z0_frame.grid(row=2, column=0, sticky='ew', pady=(0, 8))
         ttk.Label(z0_frame, text='Z0 (参考阻抗 Ω):').pack(side='left')
         self.z0_var = ttk.DoubleVar(value=50.0)
         ttk.Entry(z0_frame, textvariable=self.z0_var, width=8).pack(side='right')
@@ -208,7 +349,7 @@ class SParamPowerSumApp:
                   text='Freq (Hz) [ min / max / step ]:').grid(row=3, column=0,
                                                                sticky='w')
         freq_frame = ttk.Frame(param_group)
-        freq_frame.grid(row=4, column=0, sticky='ew', pady=(2, 0))
+        freq_frame.grid(row=4, column=0, sticky='ew', pady=(3, 0))
         freq_frame.columnconfigure((0, 1, 2), weight=1, uniform='freq')
         # StringVar + 科学计数法显示 (如 1e+07), 支持表达式输入,
         # 重算时经 evaluate_expr 求值; 修改任一基本参数都会触发
@@ -218,13 +359,13 @@ class SParamPowerSumApp:
         self.fstep_var = ttk.StringVar(value='1e+07')
         for col, var in enumerate((self.fmin_var, self.fmax_var, self.fstep_var)):
             ttk.Entry(freq_frame, textvariable=var, width=8,
-                      font=('Consolas', 9)).grid(
-                row=0, column=col, sticky='ew', padx=(0 if col == 0 else 2, 0))
+                      font='AppMono').grid(
+                row=0, column=col, sticky='ew', padx=(0 if col == 0 else 3, 0))
             var.trace_add('write', lambda *_: self._schedule_recalculate())
 
-        # ===== ICN / ccICN 参数: 启用开关 + 变量输入 + 公式编辑区 =====
-        icn_group = ttk.LabelFrame(panel, text='ICN相关计算', padding=8)
-        icn_group.grid(row=2, column=0, sticky='ew', pady=(0, 6))
+        # ---- ICN计算: 启用开关 + 变量输入 + 公式编辑区 ----
+        icn_group = ttk.LabelFrame(panel, text='ICN计算', padding=10)
+        icn_group.grid(row=2, column=0, sticky='ew', pady=(0, 10))
         icn_group.columnconfigure(1, weight=1)
 
         # 启用开关: 关闭时不计算 ICN/ccICN, 「计算数据」表格也不显示对应列
@@ -232,11 +373,11 @@ class SParamPowerSumApp:
                         variable=self.icn_enabled_var,
                         bootstyle='round-toggle',
                         command=self._on_icn_toggle).grid(
-            row=0, column=0, columnspan=3, sticky='w', pady=(0, 4))
+            row=0, column=0, columnspan=3, sticky='w', pady=(0, 6))
 
         icn_labels = {
-            'ant_v': 'Ant 近端幅度 (V) 非pk-pk值',
-            'aft_v': 'Aft 远端幅度 (V) 非pk-pk值',
+            'ant_v': 'Ant 近端幅度 (V)（非pk-pk）',
+            'aft_v': 'Aft 远端幅度 (V)（非pk-pk）',
             'fb_hz': 'fb 波特率 (Hz)',
             'tnt_s': 'Tnt 近端上升时间 (s)',
             'tft_s': 'Tft 远端上升时间 (s)',
@@ -250,208 +391,91 @@ class SParamPowerSumApp:
         for row, (key, default) in enumerate(self._ICN_SCALAR_DEFAULTS,
                                              start=1):
             ttk.Label(icn_group, text=icn_labels[key] + ':').grid(
-                row=row, column=0, sticky='w', pady=1)
+                row=row, column=0, sticky='w', pady=2)
             var = ttk.StringVar(value=default)
             self.icn_scalar_vars[key] = var
             setattr(self, key + '_var', var)
             ttk.Entry(icn_group, textvariable=var, width=16,
-                      font=('Consolas', 9)).grid(
-                row=row, column=1, sticky='e', pady=1)
+                      font='AppMono').grid(
+                row=row, column=1, sticky='e', pady=2)
             var.trace_add('write', lambda *_: self._schedule_recalculate())
 
         # ---- 公式区: 只读展示; 点「编辑」方可修改, 点「完成」校验并生效 ----
         ttk.Separator(icn_group, orient='horizontal').grid(
-            row=9, column=0, columnspan=3, sticky='ew', pady=(6, 4))
+            row=9, column=0, columnspan=3, sticky='ew', pady=(8, 6))
         ttk.Label(icn_group,
                   text='计算公式 (点击「编辑」修改, 「完成」生效):',
-                  font=('TkDefaultFont', 8, 'bold')).grid(
-            row=10, column=0, columnspan=3, sticky='w')
+                  font='AppBold').grid(
+            row=10, column=0, columnspan=3, sticky='w', pady=(0, 2))
 
         self.formula_vars = {}
         self.formula_widgets = {}
         for row, (key, default) in enumerate(DEFAULT_FORMULAS.items(),
                                              start=11):
             ttk.Label(icn_group, text=key,
-                      font=('TkDefaultFont', 8)).grid(
-                row=row, column=0, sticky='w', pady=1)
+                      font='AppSmall').grid(
+                row=row, column=0, sticky='w', pady=2)
             var = ttk.StringVar(value=default)
             self.formula_vars[key] = var
             setattr(self, 'formula_var_' + key, var)
             # 输入框固定宽度展示 (公式可点选全量复制查看)
             entry = ttk.Entry(icn_group, textvariable=var, width=30,
-                              font=('Consolas', 8), state='readonly')
-            entry.grid(row=row, column=1, sticky='ew', pady=1, padx=(4, 2))
+                              font='AppMonoSmall', state='readonly')
+            entry.grid(row=row, column=1, sticky='ew', pady=2, padx=(4, 2))
             btn = ttk.Button(icn_group, text='编辑', width=4,
                              bootstyle='secondary-outline',
                              command=lambda k=key: self._toggle_formula_edit(k))
-            btn.grid(row=row, column=2, sticky='e', pady=1)
+            btn.grid(row=row, column=2, sticky='e', pady=2)
             self.formula_widgets[key] = (entry, btn)
 
-        # (计算结果不在此处展示; 在「计算结果」窗口曲线图下方的「计算数据」表格中)
+        # ---- 界面设置: 全局字体大小 ----
+        ui_group = ttk.LabelFrame(panel, text='界面设置', padding=10)
+        ui_group.grid(row=3, column=0, sticky='ew')
+        ttk.Label(ui_group, text='全局字体大小:').pack(side='left')
+        font_combo = ttk.Combobox(ui_group, textvariable=self.font_size_var,
+                                  state='readonly', width=4,
+                                  values=[str(i) for i in range(9, 15)])
+        font_combo.pack(side='right')
 
-        auto_group = ttk.LabelFrame(panel,
-                                    text='端口自动勾选 (仅标准对称S参数可用)',
-                                    padding=8)
-        auto_group.grid(row=3, column=0, sticky='ew', pady=(0, 6))
-        self.auto_select_var = ttk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            auto_group,
-            text='启用自动勾选 (仅需手动选择受害端口。攻击端口会自动选择)',
-            variable=self.auto_select_var,
-            command=self.on_auto_select_toggle).pack(anchor='w')
-        self.arrange_var = ttk.StringVar(value='Type1')
-        ttk.Radiobutton(auto_group, text='排列一: 如N=8, 同侧(1,2,3,4) 对侧(5,6,7,8)',
-                        variable=self.arrange_var, value='Type1',
-                        command=self.on_arrange_changed).pack(anchor='w', padx=(10, 0))
-        ttk.Radiobutton(auto_group, text='排列二: 如N=8, 同侧(1,3,5,7) 对侧(2,4,6,8)',
-                        variable=self.arrange_var, value='Type2',
-                        command=self.on_arrange_changed).pack(anchor='w', padx=(10, 0))
+    # ==================== 中栏: 计算结果 ====================
 
-        ttk.Button(panel, text='保存当前文件配置', command=self.save_config,
-                   bootstyle='success-outline').grid(row=4, column=0, sticky='ew',
-                                                     pady=(6, 0))
-        ttk.Button(panel, text='显示图表窗口', command=self._open_plot_window,
-                   bootstyle='info-outline').grid(row=5, column=0, sticky='ew',
-                                                  pady=(6, 0))
+    def _build_center_panel(self):
+        mid_frame = ttk.LabelFrame(self._main_paned, text='计算结果', padding=8)
+        self._main_paned.add(mid_frame, weight=1)
 
-        # ===== 右侧面板 (端口勾选映射表; 图表已拆分为独立窗口) =====
-        right_frame = ttk.Frame(main_paned)
-        main_paned.add(right_frame, weight=1)
-
-        table_group = ttk.LabelFrame(right_frame, text='端口勾选映射表', padding=8)
-        table_group.pack(fill='both', expand=True)
-
-        self.table_msg_var = ttk.StringVar(
-            value='▶ 差分模式：Victim 必须勾选 2 个；攻击端口必须成对勾选'
-                  '（对子按左侧「排列方式」划分）。')
-        ttk.Label(table_group, textvariable=self.table_msg_var,
-                  font=('TkDefaultFont', 9, 'bold'),
-                  foreground='#cc4d1a').pack(fill='x', pady=(0, 5), anchor='w')
-
-        sel_frame = ttk.Frame(table_group)
-        sel_frame.pack(fill='x', pady=(0, 5))
-        ttk.Label(sel_frame, text='快捷全选列:').pack(side='left')
-        self.chk_all_v_var = ttk.BooleanVar(value=False)
-        self.chk_all_f_var = ttk.BooleanVar(value=False)
-        self.chk_all_n_var = ttk.BooleanVar(value=False)
-        ttk.Checkbutton(sel_frame, text='全选 Victim', variable=self.chk_all_v_var,
-                        command=lambda: self.toggle_all_column(0, self.chk_all_v_var.get())
-                        ).pack(side='left', padx=5)
-        ttk.Checkbutton(sel_frame, text='全选 FEXT', variable=self.chk_all_f_var,
-                        command=lambda: self.toggle_all_column(1, self.chk_all_f_var.get())
-                        ).pack(side='left', padx=5)
-        ttk.Checkbutton(sel_frame, text='全选 NEXT', variable=self.chk_all_n_var,
-                        command=lambda: self.toggle_all_column(2, self.chk_all_n_var.get())
-                        ).pack(side='left', padx=5)
-        ttk.Label(sel_frame, text='端口名对齐:').pack(side='left', padx=(15, 3))
-        align_combo = ttk.Combobox(sel_frame, textvariable=self.name_align_var,
-                                   state='readonly', width=4,
-                                   values=['左', '居中', '右'])
-        align_combo.pack(side='left')
-        align_combo.bind('<<ComboboxSelected>>',
-                         lambda e: self._apply_name_align())
-
-        tree_container = ttk.Frame(table_group)
-        tree_container.pack(fill='both', expand=True)
-
-        style = ttk.Style()
-        style.configure('Treeview', rowheight=25)
-        style.configure('Treeview.Heading', font=('TkDefaultFont', 9, 'bold'))
-
-        self.tree = ttk.Treeview(tree_container,
-                                 columns=('Port', 'Name', 'Victim', 'FEXT', 'NEXT'),
-                                 show='headings', height=10)
-        self.tree.heading('Port', text='Port')
-        self.tree.heading('Name', text='端口名 (解析自S参数注释)')
-        self.tree.heading('Victim', text='Victim')
-        self.tree.heading('FEXT', text='FEXT')
-        self.tree.heading('NEXT', text='NEXT')
-        self.tree.column('Port', width=80, anchor='center', stretch=False)
-        self.tree.column('Name', width=200, anchor='w', stretch=True)
-        self.tree.column('Victim', width=65, anchor='center', stretch=False)
-        self.tree.column('FEXT', width=65, anchor='center', stretch=False)
-        self.tree.column('NEXT', width=65, anchor='center', stretch=False)
-        # 交替行底色 + Victim 行高亮
-        self.tree.tag_configure('odd', background='#f5f8fb')
-        self.tree.tag_configure('victim', background='#e7f1ff')
-
-        vsb = ttk.Scrollbar(tree_container, orient='vertical', command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side='left', fill='both', expand=True)
-        vsb.pack(side='right', fill='y')
-        self.tree.bind('<Button-1>', self.on_table_click)
-
-        # ---- 分割条位置自适应左侧内容宽度 ----
-        # ScrolledFrame 会把内容宽度钉死在视口宽度上, 因此先量出左栏
-        # 各分组的自然请求宽度, 视口取最宽分组 (+滚动条余量), 并在
-        # 首次布局后显式放置分割条, 避免每次启动手动调整。
-        try:
-            inner = panel._canvas.winfo_children()[0]
-            inner.update_idletasks()
-            groups = inner.winfo_children()
-            needed = max(c.winfo_reqwidth() for c in groups) + 24
-            panel._canvas.configure(width=needed)
-            self.root.after_idle(
-                lambda: main_paned.sashpos(0, needed + 44))
-        except (AttributeError, IndexError, tk.TclError):
-            pass
-
-    # -------------------- 独立图表窗口 --------------------
-
-    def _open_plot_window(self):
-        """创建或聚焦独立图表窗口 (主窗口与图表窗口一一对应)。
-
-        已存在时置顶聚焦并重算刷新, 不会新建第二个; 被用户关闭后可经
-        「显示图表窗口」按钮或本方法重新打开。每次打开/聚焦都重新
-        计算, 保证展示的不是旧结果。
-        """
-        if self.plot_window is not None:
-            if self.plot_window.winfo_exists():
-                self.plot_window.lift()
-                self.plot_window.focus_force()
-                if self.file_loaded:
-                    self.auto_calculate()
-                return
-            self.plot_window = None
-
-        win = ttk.Toplevel(self.root)
-        win.title('计算结果')
-        self.plot_window = win
-
-        # 默认停靠在主窗口右侧
-        self.root.update_idletasks()
-        x = self.root.winfo_rootx() + self.root.winfo_width() + 10
-        y = self.root.winfo_rooty()
-        win.geometry(f'860x640+{max(x, 0)}+{max(y, 0)}')
-        win.minsize(500, 460)
-
-        self._build_plot_window_content(win)
-
-        # 用户主动关闭图表窗口: 只关图表, 不影响主窗口
-        win.protocol('WM_DELETE_WINDOW', self._on_plot_window_close)
-
-        # 打开后重新计算刷新 (不展示旧结果)
-        if self.file_loaded:
-            self.auto_calculate()
-
-    def _build_plot_window_content(self, win):
-        """在独立窗口内构建工具行 (曲线开关 + Mark Freq) 与绘图区。"""
-        toolbar = ttk.Frame(win, padding=(8, 8, 8, 0))
+        # ---- 曲线操作栏 (曲线图上方): 曲线开关 + Mark Freq + 字号滑块 ----
+        toolbar = ttk.Frame(mid_frame, padding=(2, 0, 2, 8))
         toolbar.pack(fill='x')
         ttk.Label(toolbar, text='曲线:').pack(side='left', padx=(0, 4))
         ttk.Checkbutton(toolbar, text='PSFEXT', variable=self.chk_fext_var,
                         command=self._on_curve_toggle).pack(side='left', padx=3)
         ttk.Checkbutton(toolbar, text='PSNEXT', variable=self.chk_next_var,
                         command=self._on_curve_toggle).pack(side='left', padx=3)
-        ttk.Checkbutton(toolbar, text='PSXT', variable=self.chk_psxt_var,
+        ttk.Checkbutton(toolbar, text='PSXTLK', variable=self.chk_psxtlk_var,
                         command=self._on_curve_toggle).pack(side='left', padx=3)
-        ttk.Separator(toolbar, orient='vertical').pack(side='left', fill='y', padx=10)
+        ttk.Separator(toolbar, orient='vertical').pack(side='left', fill='y',
+                                                       padx=10)
         ttk.Label(toolbar, text='Mark Freq (上限 GHz):').pack(side='left')
         ttk.Entry(toolbar, textvariable=self.mark_freq_var, width=10).pack(
             side='left', padx=(4, 0))
+        ttk.Separator(toolbar, orient='vertical').pack(side='left', fill='y',
+                                                       padx=10)
+        ttk.Label(toolbar, text='曲线字体:').pack(side='left')
+        ttk.Scale(toolbar, from_=8, to=22, variable=self.plot_font_var,
+                  length=120).pack(side='left', padx=(6, 2))
+        self._plot_font_label = ttk.Label(
+            toolbar, text=str(self.plot_font_var.get()), width=2)
+        self._plot_font_label.pack(side='left')
 
-        self.plot_frame = ttk.Frame(win)
-        self.plot_frame.pack(fill='both', expand=True, padx=8, pady=8)
+        # ---- 上下垂直分割: 曲线图 (上, 自适应) / 计算数据 (下, 可拖动调高) ----
+        self._mid_split = ttk.Panedwindow(mid_frame, orient='vertical')
+        self._mid_split.pack(fill='both', expand=True)
+
+        # 曲线图容器: 画布按 16:10 比例在其中居中 (letterbox),
+        # 任何区域拖动引发的大小变化都会重适配, 比例保持不变
+        self.plot_frame = ttk.Frame(self._mid_split)
+        self._mid_split.add(self.plot_frame, weight=1)
+        self.plot_frame.bind('<Configure>', self._schedule_plot_fit)
 
         try:
             import matplotlib
@@ -459,18 +483,18 @@ class SParamPowerSumApp:
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-            self.fig = Figure(figsize=(7, 3.5), dpi=100)
+            self.fig = Figure(figsize=(8, 5), dpi=100)
             self.ax = self.fig.add_subplot(111)
             self.canvas_mpl = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
-            self.canvas_mpl.get_tk_widget().pack(fill='both', expand=True)
-            self.ax.set_xlabel('Frequency (GHz)', fontweight='bold')
-            self.ax.set_ylabel('Magnitude (dB)', fontweight='bold')
+            fs = self._plot_fontsize()
+            self.ax.set_xlabel('Frequency (GHz)', fontsize=fs,
+                               fontweight='bold')
+            self.ax.set_ylabel('Magnitude (dB)', fontsize=fs, fontweight='bold')
+            self.ax.tick_params(labelsize=fs - 1)
             self.ax.grid(True, alpha=0.4)
             self.fig.tight_layout()
             self.canvas_mpl.draw()
-
-            if self.plot_data:
-                self.draw_curves()
+            self.root.after_idle(self._fit_plot_canvas)
         except Exception as e:
             self.fig = None
             self.ax = None
@@ -478,23 +502,307 @@ class SParamPowerSumApp:
             ttk.Label(self.plot_frame, text=f'图表初始化失败: {e}',
                       bootstyle='danger').pack(expand=True)
 
-        # ---- 计算数据区: 曲线图下方, 1 行表格 ----
-        # 列 = 勾选曲线的 Mark 峰值 (PSFEXT/PSNEXT/PSXT, dB)
+        # ---- 计算数据区: 垂直分割下栏, 1 行表格 ----
+        # 列 = 勾选曲线的 Mark 峰值 (PSFEXT/PSNEXT/PSXTLK, dB)
         #       + ICN 开关打开时的 6 个 ICN/ccICN 结果 (mV);
-        # 复制按钮在表格上方; 单元格用只读 Entry (tk): 文本可自由框选复制
-        res_frame = ttk.LabelFrame(win, text='计算数据', padding=(8, 4))
-        res_frame.pack(fill='x', padx=8, pady=(0, 8))
-        ttk.Button(res_frame, text='复制表格', width=10,
+        # 按钮在表格上方左侧; 单元格用只读 Entry (tk): 文本可自由框选复制
+        self._res_frame = ttk.LabelFrame(self._mid_split, text='计算数据',
+                                         padding=(10, 8))
+        self._mid_split.add(self._res_frame, weight=0)
+        btn_row = ttk.Frame(self._res_frame)
+        btn_row.pack(fill='x', pady=(0, 8))
+        ttk.Button(btn_row, text='复制表格', width=10,
                    bootstyle='secondary-outline',
-                   command=self._copy_data_table).pack(anchor='e', pady=(0, 4))
-        # 表格外框容器: highlightthickness 提供明显外框线,
-        # 各单元格 relief='solid' 提供内框线
-        self._table_outer = tk.Frame(res_frame, bg='white',
-                                     highlightbackground='#5a5a5a',
-                                     highlightcolor='#5a5a5a',
-                                     highlightthickness=1, bd=0)
-        self._table_outer.pack(fill='x')
+                   command=self._copy_data_table).pack(side='left')
+        ttk.Button(btn_row, text='批量导出', width=10,
+                   bootstyle='info-outline',
+                   command=self._open_batch_export).pack(side='left',
+                                                         padx=(8, 0))
+        # 表格外框容器: 不再带外框线 (单元格 relief='solid' 已构成完整表框)
+        self._table_outer = tk.Frame(self._res_frame, bg='white', bd=0,
+                                     highlightthickness=0)
+        self._table_outer.pack(fill='x', pady=(0, 2))
         self._refresh_data_table()
+
+    # -------------------- 曲线图 16:10 比例自适应 --------------------
+
+    _PLOT_RATIO = 16 / 10     # 曲线图默认宽高比 16:10
+    _PLOT_FIT_DELAY_MS = 120
+
+    def _schedule_plot_fit(self, _event=None):
+        """容器大小变化时防抖重适配画布 (保持 16:10)。"""
+        if self.canvas_mpl is None:
+            return
+        if self._plot_fit_job is not None:
+            self.root.after_cancel(self._plot_fit_job)
+        self._plot_fit_job = self.root.after(self._PLOT_FIT_DELAY_MS,
+                                             self._fit_plot_canvas)
+
+    def _fit_plot_canvas(self):
+        """在容器内放入最大 16:10 画布并居中 (letterbox), 比例不随拖动改变。"""
+        self._plot_fit_job = None
+        if self.canvas_mpl is None or self.fig is None:
+            return
+        try:
+            cw = self.plot_frame.winfo_width()
+            ch = self.plot_frame.winfo_height()
+        except tk.TclError:
+            return
+        if cw < 60 or ch < 60:
+            return
+        w, h = cw, int(cw / self._PLOT_RATIO)
+        if h > ch:
+            h = ch
+            w = int(h * self._PLOT_RATIO)
+        widget = self.canvas_mpl.get_tk_widget()
+        widget.place(x=(cw - w) // 2, y=(ch - h) // 2, width=w, height=h)
+        self.fig.tight_layout()
+        self.canvas_mpl.draw_idle()
+
+    def _adapt_data_area(self):
+        """「计算数据」区默认高度取整个窗口的 1/3 (为曲线图保留最小高度),
+        用户可拖动水平分割条上下调整, 曲线图区随动自适应。"""
+        try:
+            total = self._mid_split.winfo_height()
+            if total <= 1:
+                self.root.after(120, self._adapt_data_area)
+                return
+            target = self.root.winfo_height() // 3
+            target = max(120, min(target, total - 240))
+            self._mid_split.sashpos(0, total - target)
+        except tk.TclError:
+            pass
+
+    # ==================== 右栏: 端口勾选 ====================
+
+    def _build_right_panel(self):
+        right_frame = ttk.LabelFrame(self._main_paned, text='端口勾选',
+                                     padding=8)
+        self._main_paned.add(right_frame, weight=0)
+        self._right_frame = right_frame
+        # 长文本随栏宽折行 (栏宽可拖动调整)
+        self._wrap_widgets = []
+        right_frame.bind('<Configure>', self._on_right_frame_configure)
+
+        # ---- 端口自动勾选 (自原左栏移入) ----
+        # 说明文字用支持折行的 ttk.Label 承载 (ttk 勾选框/单选框不支持折行)
+        auto_group = ttk.LabelFrame(
+            right_frame, text='端口自动勾选 (仅标准对称S参数可用)', padding=8)
+        auto_group.pack(fill='x', pady=(0, 10))
+        self.auto_select_var = ttk.BooleanVar(value=False)
+        ttk.Checkbutton(auto_group, text='启用自动勾选',
+                        variable=self.auto_select_var,
+                        command=self.on_auto_select_toggle).pack(anchor='w')
+        auto_hint = ttk.Label(
+            auto_group, font='AppSmall', foreground='#555555',
+            text='仅需手动选择受害端口，攻击端口会自动勾选。')
+        auto_hint.pack(anchor='w', padx=(22, 0))
+        self._wrap_widgets.append(auto_hint)
+        self.arrange_var = ttk.StringVar(value='Type1')
+        rb_frame = ttk.Frame(auto_group)
+        rb_frame.pack(anchor='w', pady=(2, 0))
+        ttk.Radiobutton(rb_frame, text='排列一', variable=self.arrange_var,
+                        value='Type1',
+                        command=self.on_arrange_changed).pack(side='left')
+        ttk.Radiobutton(rb_frame, text='排列二', variable=self.arrange_var,
+                        value='Type2',
+                        command=self.on_arrange_changed).pack(side='left',
+                                                              padx=(8, 0))
+        arrange_hint = ttk.Label(
+            auto_group, font='AppSmall', foreground='#555555',
+            text='以N=8为例：排列一同侧(1,2,3,4) 对侧(5,6,7,8)；'
+                 '排列二同侧(1,3,5,7) 对侧(2,4,6,8)。')
+        arrange_hint.pack(anchor='w', padx=(22, 0))
+        self._wrap_widgets.append(arrange_hint)
+
+        self.table_msg_var = ttk.StringVar(
+            value='▶ 差分模式：Victim 必须勾选 2 个；攻击端口必须成对勾选'
+                  '（对子按上方「排列方式」划分）。')
+        msg_label = ttk.Label(right_frame, textvariable=self.table_msg_var,
+                              font='AppBold', foreground='#cc4d1a')
+        msg_label.pack(fill='x', pady=(2, 8), anchor='w')
+        self._wrap_widgets.append(msg_label)
+
+        # 全选/全反选勾选框内嵌在端口列表表头 (见 _build_port_header),
+        # 变量在此创建 (配置恢复依赖)
+        self.chk_all_v_var = ttk.BooleanVar(value=False)
+        self.chk_all_f_var = ttk.BooleanVar(value=False)
+        self.chk_all_n_var = ttk.BooleanVar(value=False)
+
+        align_frame = ttk.Frame(right_frame)
+        align_frame.pack(fill='x', pady=(0, 8))
+        ttk.Label(align_frame, text='端口名对齐:').pack(side='left', padx=(0, 3))
+        align_combo = ttk.Combobox(align_frame, textvariable=self.name_align_var,
+                                   state='readonly', width=4,
+                                   values=['左', '居中', '右'])
+        align_combo.pack(side='left')
+        align_combo.bind('<<ComboboxSelected>>',
+                         lambda e: self._apply_name_align())
+
+        # ---- 端口勾选表: 真实勾选框 (现代默认样式),
+        #      列序 Port/端口名/Victim/FEXT/NEXT;
+        #      表头冻结在滚动区外 (不随数据行上下滚动),
+        #      竖向滚动条固定显示, 避免鼠标移入移出导致列表宽度抖动 ----
+        self.port_list = ttk.ScrolledFrame(right_frame, autohide=False,
+                                           padding=0)
+        sb_w = self.port_list._vbar.winfo_reqwidth()
+        self._port_header = ttk.Frame(right_frame)
+        # 表头右侧留出滚动条宽度, 使表头列与数据区列对齐
+        self._port_header.pack(fill='x', pady=(2, 0), padx=(0, sb_w))
+        self.port_list.pack(fill='both', expand=True)
+        self._build_port_header()
+        self._sync_port_columns()
+        # 首帧后按滚动条实际渲染宽度校正一次表头留白
+        self.root.after_idle(self._align_port_header)
+
+    def _on_right_frame_configure(self, event):
+        """右栏宽度变化时, 长文本控件按可用宽度折行。"""
+        wrap = max(180, event.width - 84)
+        for w in self._wrap_widgets:
+            try:
+                w.configure(wraplength=wrap)
+            except tk.TclError:
+                pass
+
+    def _build_port_header(self):
+        """端口勾选表表头 (冻结在滚动区外, 不随数据行上下滚动)。
+
+        Victim/FEXT/NEXT 三列表头内嵌全选/全反选勾选框,
+        取代独立的全选行, 省空间且正对目标列。
+        """
+        header = self._port_header
+        for w in header.winfo_children():
+            w.destroy()
+        all_vars = (self.chk_all_v_var, self.chk_all_f_var,
+                    self.chk_all_n_var)
+        for col, text in enumerate(('Port', '端口名', 'Victim', 'FEXT', 'NEXT')):
+            if col >= 2:
+                idx = col - 2
+                cell = ttk.Frame(header)
+                cell.grid(row=0, column=col, padx=2, pady=(0, 3))
+                ttk.Checkbutton(
+                    cell, variable=all_vars[idx],
+                    command=lambda i=idx: self.toggle_all_column(
+                        i, all_vars[i].get())).pack(side='left')
+                ttk.Label(cell, text=text, font='AppBold').pack(side='left')
+            elif col == 1:
+                lbl = ttk.Label(header, text=text, font='AppBold',
+                                anchor=self._name_anchor())
+                self._port_name_header = lbl
+                lbl.grid(row=0, column=col, sticky='ew', padx=4, pady=(0, 3))
+            else:
+                ttk.Label(header, text=text, font='AppBold',
+                          anchor='center').grid(row=0, column=col, sticky='ew',
+                                                padx=4, pady=(0, 3))
+        ttk.Separator(header, orient='horizontal').grid(
+            row=1, column=0, columnspan=5, sticky='ew', pady=(0, 3))
+
+    def _align_port_header(self):
+        """按滚动条实际渲染宽度校正冻结表头右侧留白, 使表头列与数据列对齐。"""
+        header = getattr(self, '_port_header', None)
+        if header is None or not header.winfo_exists():
+            return
+        try:
+            vbar = self.port_list._vbar
+            sb_w = vbar.winfo_width() or vbar.winfo_reqwidth()
+        except (AttributeError, tk.TclError):
+            return
+        header.pack_configure(padx=(0, sb_w))
+
+    def _sync_port_columns(self):
+        """同步冻结表头与滚动数据区的列宽配置:
+        Port/勾选框列固定宽度, 端口名列随端口名文字长度自适应
+        并吸收多余宽度 (两容器列宽一致, 保证表头与数据行对齐)。"""
+        if getattr(self, '_port_header', None) is None:
+            return
+        port_w = self._font_bold.measure('Port') + 12
+        name_min = self._font_bold.measure('端口名') + 12
+        for (_, port_label, name_label) in self._port_rows:
+            port_w = max(port_w,
+                         self.default_font.measure(port_label.cget('text'))
+                         + 12)
+            name_min = max(name_min,
+                           self.default_font.measure(name_label.cget('text'))
+                           + 12)
+        role_w = max(72, max(self._font_bold.measure(t)
+                             for t in ('Victim', 'FEXT', 'NEXT')) + 56)
+        minsizes = (port_w, name_min, role_w, role_w, role_w)
+        for container in (self._port_header, self.port_list):
+            for col, width in enumerate(minsizes):
+                container.columnconfigure(
+                    col, minsize=width, weight=1 if col == 1 else 0)
+
+    # -------------------- 分割条位置自适应 --------------------
+
+    def _layout_initial_sashes(self):
+        """启动后按内容自适应左右栏默认宽度 (用户仍可拖动分割条)。"""
+        try:
+            self.root.update_idletasks()
+            total = self._main_paned.winfo_width()
+            if total <= 1:      # 窗口尚未映射, 稍后重试
+                self.root.after(150, self._layout_initial_sashes)
+                return
+            left_w = self._measure_left_width()
+            right_w = self._measure_right_width()
+            self._main_paned.sashpos(0, left_w)
+            self._main_paned.sashpos(1, max(left_w + 240, total - right_w))
+            self._adapt_data_area()
+        except tk.TclError:
+            pass
+
+    def _measure_left_width(self):
+        """左栏内容自然宽度: ScrolledFrame 会把内容宽度钉死在视口宽度上,
+        因此先量出各分组的自然请求宽度, 视口取最宽分组 (+滚动条余量)。"""
+        try:
+            panel = self._left_scrolled
+            panel.update_idletasks()
+            groups = panel.winfo_children()
+            if not groups:
+                return 300
+            needed = max(c.winfo_reqwidth() for c in groups) + 24
+            panel._canvas.configure(width=needed)
+            return needed + 44      # LabelFrame 内边距 + 边框余量
+        except (AttributeError, tk.TclError):
+            return 300
+
+    def _measure_right_width(self):
+        """右栏内容自然宽度: Port 列 + 端口名列 (随端口名文字长度)
+        + 勾选框 3 列 + 滚动条/边距余量, 并限制在屏幕 1/4 内。
+        (列宽口径与 _sync_port_columns 一致)"""
+        bold = self._font_bold
+        port_w = bold.measure('Port') + 12
+        name_px = bold.measure('端口名') + 12
+        for (_, port_label, name_label) in self._port_rows:
+            port_w = max(port_w,
+                         self.default_font.measure(port_label.cget('text'))
+                         + 12)
+            name_px = max(name_px,
+                          self.default_font.measure(name_label.cget('text'))
+                          + 12)
+        width = port_w + name_px
+        for text in ('Victim', 'FEXT', 'NEXT'):
+            # 表头为 全选勾选框 + 文字 的组合单元格
+            width += max(72, bold.measure(text) + 56)
+        try:
+            width += self.port_list._vbar.winfo_reqwidth()
+        except (AttributeError, tk.TclError):
+            width += 16
+        width += 20
+        limit = max(300, self.root.winfo_screenwidth() // 4)
+        return int(min(max(width + 36, 300), limit))
+
+    def _adapt_right_pane(self):
+        """导入 S 参数后按端口名长度重新自适应右栏宽度。"""
+        try:
+            total = self._main_paned.winfo_width()
+            if total <= 1:
+                self.root.after(120, self._adapt_right_pane)
+                return
+            right_w = self._measure_right_width()
+            left = self._main_paned.sashpos(0)
+            self._main_paned.sashpos(1, max(left + 240, total - right_w))
+        except tk.TclError:
+            pass
 
     # -------------------- 「计算数据」表格 --------------------
 
@@ -502,18 +810,39 @@ class SParamPowerSumApp:
         """当前应显示的数据列: [(列名, 单位)]。
 
         左侧 3 列为勾选曲线的 Mark 峰值 (dB), 未勾选的曲线不显示;
-        右侧 6 列为 ICN/ccICN 结果 (mV), 主界面 ICN 开关关闭时不显示。
+        右侧 6 列为 ICN/ccICN 结果, 左栏 ICN 开关关闭时不显示;
+        ICN/ccICN 列单位随最近一次计算值自适应 (V/mV/µV/nV/pV)。
         """
         cols = []
         for name, chk in (('PSFEXT', self.chk_fext_var),
                           ('PSNEXT', self.chk_next_var),
-                          ('PSXT', self.chk_psxt_var)):
+                          ('PSXTLK', self.chk_psxtlk_var)):
             if chk.get():
                 cols.append((name, 'dB'))
         if self.icn_enabled_var.get():
-            cols.extend((name, 'mV') for name in
-                        ('ICN_n', 'ICN_f', 'ICN', 'ccICN_n', 'ccICN_f', 'ccICN'))
+            res = self._last_icn_results
+            for name in ('ICN_n', 'ICN_f', 'ICN', 'ccICN_n', 'ccICN_f', 'ccICN'):
+                unit = 'mV'
+                if res is not None:
+                    _, unit = self._icn_display(res[name.lower()])
+                cols.append((name, unit))
         return cols
+
+    @staticmethod
+    def _icn_display(value_v):
+        """ICN 结果 (V) → (显示值, 单位): 单位按数值量级自适应缩放,
+        如 0.12256 mV 显示为 122.56 µV; 缩放本身不损失精度
+        (纯 10 的幂次换算), 仅在最终显示时保留 2 位小数。"""
+        av = abs(value_v)
+        if av >= 1.0:
+            return value_v, 'V'
+        if av >= 1e-3:
+            return value_v * 1e3, 'mV'
+        if av >= 1e-6:
+            return value_v * 1e6, 'µV'
+        if av >= 1e-9:
+            return value_v * 1e9, 'nV'
+        return value_v * 1e12, 'pV'
 
     def _refresh_data_table(self):
         """重建/刷新「计算数据」表格 (列结构变化时重建, 否则只更新数值)。"""
@@ -527,24 +856,27 @@ class SParamPowerSumApp:
         if tuple(cols) != self._data_table_cols:
             for w in outer.winfo_children():
                 w.destroy()
+            # 清掉上一轮列的宽度权重, 避免列数变少后残留空列槽位把表格压窄
+            for col in range(len(self._data_table_cols or ())):
+                outer.columnconfigure(col, weight=0, uniform='')
             self.data_table_vars = {}
             self._data_table_cols = tuple(cols)
             if not cols:
                 ttk.Label(outer,
                           text='(无可显示的数据列: 请勾选曲线或打开 ICN 开关)',
-                          font=('TkDefaultFont', 8)).pack(padx=4, pady=2)
+                          font='AppSmall').pack(padx=6, pady=4)
             else:
                 for col, (name, unit) in enumerate(cols):
                     tk.Label(outer, text=f'{name} ({unit})',
-                             font=('TkDefaultFont', 9, 'bold'),
+                             font='AppBold',
                              bg='#e9ecef', relief='solid', bd=1).grid(
-                        row=0, column=col, sticky='nsew')
+                        row=0, column=col, sticky='nsew', ipady=3)
                     var = ttk.StringVar(value='--')
                     self.data_table_vars[name] = var
                     tk.Entry(outer, textvariable=var, state='readonly',
-                             font=('Consolas', 9), relief='solid', bd=1,
+                             font='AppMonoLg', relief='solid', bd=1,
                              readonlybackground='white', justify='center'
-                             ).grid(row=1, column=col, sticky='nsew')
+                             ).grid(row=1, column=col, sticky='nsew', ipady=3)
                     outer.columnconfigure(col, weight=1, uniform='dt')
 
         marks = self._last_mark_peaks
@@ -556,18 +888,25 @@ class SParamPowerSumApp:
             if unit == 'dB':
                 point = marks.get(name)
                 var.set(f'{point[1]:.2f}' if point is not None else '--')
+            elif res is None:
+                var.set('--')
             else:
-                var.set(f'{res[name.lower()] * 1e3:.6g}' if res else '--')
+                value, _ = self._icn_display(res[name.lower()])
+                var.set(f'{value:.2f}')
+
+        # 「批量导出」窗口开着时, 其列结构与单位跟随本表实时刷新
+        if self._batch_tree is not None and self._batch_tree.winfo_exists():
+            self._batch_refresh_tree()
 
     def _copy_data_table(self):
         """复制整表 (表头含单位 + 1 行数值, 制表符分隔), 可直接粘贴进 Excel。"""
         cols = self._data_table_columns()
-        if not cols or not self.data_table_vars or self.plot_window is None:
+        if not cols or not self.data_table_vars:
             return
         header = '\t'.join(f'{name} ({unit})' for name, unit in cols)
         values = '\t'.join(self.data_table_vars[name].get() for name, _ in cols)
-        self.plot_window.clipboard_clear()
-        self.plot_window.clipboard_append(f'{header}\n{values}')
+        self.root.clipboard_clear()
+        self.root.clipboard_append(f'{header}\n{values}')
         self._set_status('状态: 计算数据已复制到剪贴板 (可直接粘贴进 Excel)')
 
     def _on_curve_toggle(self):
@@ -582,25 +921,239 @@ class SParamPowerSumApp:
         else:
             self._refresh_data_table()
 
-    def _on_plot_window_close(self):
-        """销毁图表窗口并复位绘图引用 (可由用户关闭或主窗口关闭触发)。"""
-        if self.plot_window is not None:
+    def _on_main_window_close(self):
+        """主窗口关闭时连带关闭「批量导出」窗口。"""
+        if self.batch_window is not None:
             try:
-                self.plot_window.destroy()
+                self.batch_window.destroy()
             except tk.TclError:
                 pass
-            self.plot_window = None
-        self.fig = None
-        self.ax = None
-        self.canvas_mpl = None
-        self.data_table_vars = {}
-        self._data_table_cols = None
-        self._table_outer = None
-
-    def _on_main_window_close(self):
-        """主窗口关闭时连带关闭图表窗口。"""
-        self._on_plot_window_close()
+            self.batch_window = None
+            self._batch_tree = None
         self.root.destroy()
+
+    # -------------------- 「批量导出」窗口 --------------------
+
+    def _open_batch_export(self):
+        """创建或聚焦「批量导出」窗口 (与主窗口一一对应)。"""
+        if self.batch_window is not None and self.batch_window.winfo_exists():
+            self.batch_window.lift()
+            self.batch_window.focus_force()
+            return
+
+        win = ttk.Toplevel(self.root)
+        win.title('批量导出')
+        win.transient(self.root)
+        self.batch_window = win
+
+        # 默认居中于主窗口
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - 960) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - 460) // 2)
+        win.geometry(f'960x460+{x}+{y}')
+        win.minsize(640, 300)
+
+        btn_bar = ttk.Frame(win, padding=(8, 8, 8, 4))
+        btn_bar.pack(fill='x')
+        ttk.Button(btn_bar, text='添加数据', width=12, bootstyle='success-outline',
+                   command=self._batch_add_data).pack(side='left')
+        ttk.Button(btn_bar, text='删除选中数据', width=13,
+                   bootstyle='danger-outline',
+                   command=self._batch_delete_selected).pack(side='left',
+                                                             padx=(8, 0))
+        ttk.Button(btn_bar, text='导出表格', width=12, bootstyle='info-outline',
+                   command=self._batch_export_csv).pack(side='left', padx=(8, 0))
+        ttk.Button(btn_bar, text='清空数据', width=12,
+                   bootstyle='secondary-outline',
+                   command=self._batch_clear).pack(side='left', padx=(8, 0))
+
+        tree_frame = ttk.Frame(win, padding=(8, 0, 8, 8))
+        tree_frame.pack(fill='both', expand=True)
+        style = ttk.Style()
+        style.configure('Treeview.Heading', font='AppBold')
+        self._batch_tree = ttk.Treeview(tree_frame, show='headings', height=10)
+        vsb = ttk.Scrollbar(tree_frame, orient='vertical',
+                            command=self._batch_tree.yview)
+        self._batch_vsb = vsb
+        hsb = ttk.Scrollbar(tree_frame, orient='horizontal',
+                            command=self._batch_tree.xview)
+        self._batch_tree.configure(yscrollcommand=vsb.set,
+                                   xscrollcommand=hsb.set)
+        self._batch_tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        # 用户主动关闭: 只关本窗口, 缓存数据保留, 不影响主窗口
+        win.protocol('WM_DELETE_WINDOW', self._on_batch_window_close)
+        self._batch_refresh_tree()
+
+    def _on_batch_window_close(self):
+        if self.batch_window is not None:
+            try:
+                self.batch_window.destroy()
+            except tk.TclError:
+                pass
+            self.batch_window = None
+            self._batch_tree = None
+
+    def _batch_columns(self):
+        """当前列表应展示的列: Port/端口名 + 主界面「计算数据」表格
+        当前数据列 (实时跟随, 含单位; 缓存行缺该列数据时显示 --)。"""
+        return ['Port', '端口名'] + [
+            f'{name} ({unit})' for name, unit in self._data_table_columns()]
+
+    def _batch_cell(self, row, name, unit):
+        """缓存行某数据列的显示值: 与「计算数据」表格口径一致
+        (dB 保留 2 位小数; ICN 原始值 (V) 按当前列单位缩放后保留 2 位小数,
+        缩放为纯 10 的幂次换算, 不损失精度)。"""
+        value = row['_vals'].get(name)
+        if value is None:
+            return '--'
+        if unit == 'dB':
+            return f'{value:.2f}'
+        return f'{value * self._BATCH_UNIT_SCALE.get(unit, 1.0):.2f}'
+
+    def _batch_refresh_tree(self):
+        """按缓存行重建/刷新列表 (列结构实时跟随主界面「计算数据」表格)。"""
+        tree = self._batch_tree
+        if tree is None or not tree.winfo_exists():
+            return
+        cols = self._batch_columns()
+        tree.delete(*tree.get_children())
+        tree['columns'] = cols
+        bold = self._font_bold
+        for col in cols:
+            tree.heading(col, text=col)
+            width = bold.measure(col) + 24
+            if col == 'Port':
+                for row in self._batch_rows:
+                    width = max(width,
+                                self.default_font.measure(row['Port']) + 28)
+                tree.column(col, width=max(width, 80), anchor='center',
+                            stretch=False)
+            elif col == '端口名':
+                for row in self._batch_rows:
+                    width = max(width,
+                                self.default_font.measure(row['端口名']) + 28)
+                tree.column(col, width=max(width, 140), anchor='w',
+                            stretch=False)
+            else:
+                tree.column(col, width=width, anchor='center', stretch=False)
+        name_unit = list(self._data_table_columns())
+        for i, row in enumerate(self._batch_rows):
+            values = [row['Port'], row['端口名']] + [
+                self._batch_cell(row, name, unit) for name, unit in name_unit]
+            tree.insert('', 'end', iid=str(i), values=values)
+        self._fit_batch_window_width()
+
+    def _fit_batch_window_width(self):
+        """窗口宽度随列表总宽自适应 (高度不变; 左右位置不动;
+        超出屏幕可用宽度时由横向滚动条兜底)。"""
+        win = self.batch_window
+        tree = self._batch_tree
+        if win is None or tree is None or not win.winfo_exists():
+            return
+        try:
+            total_w = sum(tree.column(c, 'width') for c in tree['columns'])
+            total_w += self._batch_vsb.winfo_reqwidth() + 16 + 4  # 边距+边框
+            max_w = win.winfo_screenwidth() - 80
+            new_w = int(min(max(total_w, 640), max_w))
+            if abs(new_w - win.winfo_width()) > 4:
+                win.geometry(f'{new_w}x{win.winfo_height()}')
+        except tk.TclError:
+            pass
+
+    def _batch_add_data(self):
+        """把主界面当前计算数据缓存进列表: 单端 1 行; 差分也是 1 行,
+        两个 Victim 端口在 Port/端口名列内以 | 合并 (CSV 单元格允许 |)。
+        缓存原始计算值 (dB / V), 展示与导出时按主表当前单位实时换算。"""
+        if not self.file_loaded or not self.plot_data:
+            self._set_status('状态: 请先导入 S 参数并完成一次计算, 再添加数据。',
+                             'warn')
+            return
+        v_ports, _, _ = self._get_selected_ports()
+        if not v_ports:
+            self._set_status('状态: 当前没有勾选 Victim 端口, 无法添加数据。',
+                             'warn')
+            return
+        names = self.spara_obj.port_names
+        vals = {}
+        for name, unit in self._data_table_columns():
+            if unit == 'dB':
+                point = self._last_mark_peaks.get(name)
+                vals[name] = point[1] if point is not None else None
+            else:
+                res = self._last_icn_results
+                vals[name] = res[name.lower()] if res is not None else None
+        row = {'Port': '|'.join(str(p) for p in v_ports),
+               '端口名': '|'.join(names[p - 1] if p - 1 < len(names) else '-'
+                                  for p in v_ports),
+               '_vals': vals}
+        self._batch_rows.append(row)
+        self._batch_refresh_tree()
+        self._set_status(f"状态: 已缓存 Port {row['Port']} 的计算数据到"
+                         f'「批量导出」列表 (共 {len(self._batch_rows)} 行)。',
+                         'success')
+
+    def _batch_delete_selected(self):
+        """删除列表中选中的缓存行 (支持 Ctrl 多选 / Shift 批量选)。"""
+        tree = self._batch_tree
+        if tree is None or not tree.winfo_exists():
+            return
+        selected = tree.selection()
+        if not selected:
+            self._set_status('状态: 请先在「批量导出」列表中选中要删除的行。',
+                             'warn')
+            return
+        for iid in sorted((int(i) for i in selected), reverse=True):
+            if 0 <= iid < len(self._batch_rows):
+                del self._batch_rows[iid]
+        self._batch_refresh_tree()
+        self._set_status(f'状态: 已删除 {len(selected)} 行缓存数据 '
+                         f'(剩余 {len(self._batch_rows)} 行)。')
+
+    def _batch_export_csv(self, filepath=None):
+        """把列表导出为 CSV (utf-8-sig, 可直接用 Excel 打开);
+        默认保存路径为 S 参数所在目录。数值展示口径与主表一致。"""
+        if not self._batch_rows:
+            self._set_status('状态: 批量导出列表为空, 请先「添加数据」。', 'warn')
+            return
+        if filepath is None:
+            initialdir = ''
+            initialfile = 'batch_export.csv'
+            if self.filepath:
+                initialdir = str(Path(self.filepath).parent)
+                initialfile = Path(self.filepath).stem + '_batch.csv'
+            filepath = ttk.filedialog.asksaveasfilename(
+                parent=self.batch_window, title='导出批量计算数据',
+                defaultextension='.csv', initialdir=initialdir or None,
+                initialfile=initialfile,
+                filetypes=[('CSV 表格', '*.csv'), ('All Files', '*.*')])
+        if not filepath:
+            return
+        cols = self._batch_columns()
+        name_unit = list(self._data_table_columns())
+        try:
+            with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(cols)
+                for row in self._batch_rows:
+                    writer.writerow(
+                        [row['Port'], row['端口名']] +
+                        [self._batch_cell(row, name, unit)
+                         for name, unit in name_unit])
+        except OSError as e:
+            ttk.Messagebox.show_error('错误', f'导出 CSV 失败：\n{e}')
+            return
+        self._set_status(f'状态: 批量导出完成 → {filepath}', 'success')
+
+    def _batch_clear(self):
+        """完全清空列表缓存, 可重新逐条添加。"""
+        self._batch_rows.clear()
+        self._batch_refresh_tree()
+        self._set_status('状态: 批量导出列表已清空, 可重新添加数据。')
 
     # -------------------- 状态栏 / 防抖 --------------------
 
@@ -642,95 +1195,85 @@ class SParamPowerSumApp:
     # -------------------- 端口表操作 --------------------
 
     def _build_port_table(self, num_ports, port_names):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        """重建端口勾选表数据行: 每行 Port + 端口名 + 3 个真实勾选框
+        (表头冻结在滚动区外, 见 _build_port_header, 此处不重建)。"""
+        container = self.port_list
+        for w in container.winfo_children():
+            w.destroy()
         self.port_vars = []
-        self.port_items = {}
-
-        max_name_width = self.default_font.measure('端口名 (解析自S参数注释)')
-        max_port_width = self.default_font.measure('Port')
+        self._port_rows = []
 
         for i in range(num_ports):
             port_str = f'Port {i + 1}'
             name_str = port_names[i] if i < len(port_names) else '-'
 
-            max_name_width = max(max_name_width, self.default_font.measure(name_str))
-            max_port_width = max(max_port_width, self.default_font.measure(port_str))
-
-            self.port_vars.append((ttk.BooleanVar(value=False),
-                                   ttk.BooleanVar(value=False),
-                                   ttk.BooleanVar(value=False)))
-            tags = ('odd',) if i % 2 else ()
-            item_id = self.tree.insert('', 'end', tags=tags,
-                                       values=(port_str, name_str, '☐', '☐', '☐'))
-            self.port_items[i + 1] = item_id
-
-        self.tree.column('Port', width=max_port_width + 40, anchor='center',
-                         stretch=False)
-        self.tree.column('Name', width=max_name_width + 40,
-                         anchor=self._name_anchor(), stretch=True)
+            vars_tuple = (ttk.BooleanVar(value=False),
+                          ttk.BooleanVar(value=False),
+                          ttk.BooleanVar(value=False))
+            self.port_vars.append(vars_tuple)
+            port_label = ttk.Label(container, text=port_str, anchor='center')
+            port_label.grid(row=i, column=0, sticky='ew', padx=(4, 2),
+                            pady=1)
+            name_label = ttk.Label(container, text=name_str,
+                                   anchor=self._name_anchor())
+            name_label.grid(row=i, column=1, sticky='ew', padx=(2, 6),
+                            pady=1)
+            v_cb = ttk.Checkbutton(container, variable=vars_tuple[0],
+                                   command=lambda p=i + 1:
+                                   self.on_victim_changed(p))
+            f_cb = ttk.Checkbutton(container, variable=vars_tuple[1],
+                                   command=self._on_attack_toggled)
+            n_cb = ttk.Checkbutton(container, variable=vars_tuple[2],
+                                   command=self._on_attack_toggled)
+            v_cb.grid(row=i, column=2, padx=4)
+            f_cb.grid(row=i, column=3, padx=4)
+            n_cb.grid(row=i, column=4, padx=(4, 6))
+            self._port_rows.append(((v_cb, f_cb, n_cb), port_label, name_label))
 
         self.sync_table_ui()
+        self._sync_port_columns()
+        self._adapt_right_pane()
 
     _NAME_ANCHORS = {'左': 'w', '居中': 'center', '右': 'e'}
 
     def _name_anchor(self):
-        return self._NAME_ANCHORS.get(self.name_align_var.get(), 'w')
+        return self._NAME_ANCHORS.get(self.name_align_var.get(), 'e')
 
     def _apply_name_align(self):
-        """应用端口名对齐方式到表格列。"""
-        self.tree.column('Name', anchor=self._name_anchor())
+        """应用端口名对齐方式到端口名列 (表头与各行)。"""
+        anchor = self._name_anchor()
+        if getattr(self, '_port_name_header', None) is not None:
+            self._port_name_header.configure(anchor=anchor)
+        for (_, _, name_label) in self._port_rows:
+            name_label.configure(anchor=anchor)
 
     def sync_table_ui(self):
-        """同步 BooleanVar 状态到 Treeview 的显示文本与行高亮"""
-        for p, item_id in self.port_items.items():
-            v_val, f_val, n_val = (var.get() for var in self.port_vars[p - 1])
-            vals = list(self.tree.item(item_id, 'values'))
-            vals[2] = '☑' if v_val else '☐'
-            vals[3] = '☑' if f_val else '☐'
-            vals[4] = '☑' if n_val else '☐'
+        """同步勾选状态到行高亮: Victim 蓝 / FEXT 红 / NEXT 绿
+        (只改颜色, 不改字体/字号; 多角色同勾时按此优先级取色)。
+
+        勾选框本身直接绑定 BooleanVar, 显示状态无需手动同步。
+        """
+        for i, (_, port_label, name_label) in enumerate(self._port_rows):
+            v_val, f_val, n_val = (var.get() for var in self.port_vars[i])
             if v_val:
-                tags = ('victim',)
-            elif (p - 1) % 2:
-                tags = ('odd',)
+                style = 'Victim.TLabel'
+            elif f_val:
+                style = 'Fext.TLabel'
+            elif n_val:
+                style = 'Next.TLabel'
             else:
-                tags = ()
-            self.tree.item(item_id, values=vals, tags=tags)
+                style = 'TLabel'
+            port_label.configure(style=style)
+            name_label.configure(style=style)
 
-    def on_table_click(self, event):
-        """处理Treeview中的勾选点击"""
-        region = self.tree.identify('region', event.x, event.y)
-        if region != 'cell':
-            return
-
-        col = self.tree.identify_column(event.x)
-        row_id = self.tree.identify_row(event.y)
-        if not row_id:
-            return
-
-        port_num = None
-        for p, item_id in self.port_items.items():
-            if item_id == row_id:
-                port_num = p
-                break
-        if port_num is None:
-            return
-
-        col_idx = int(col.replace('#', ''))
-        if col_idx < 3:
-            return
-
-        var = self.port_vars[port_num - 1][col_idx - 3]
-        var.set(not var.get())
+    def _on_attack_toggled(self):
+        """FEXT/NEXT 勾选变化: 更新行高亮并重算。"""
         self.sync_table_ui()
-
-        if col_idx == 3:
-            self.on_victim_changed(port_num)
-        else:
-            self.auto_calculate()
+        self.auto_calculate()
 
     def on_victim_changed(self, clicked_port):
         """当Victim复选框状态改变时，感知具体的端口号"""
+        self.sync_table_ui()
         if self.auto_select_var.get():
             if self.port_vars[clicked_port - 1][0].get():
                 self.auto_select_ports(target_port=clicked_port)
@@ -872,7 +1415,7 @@ class SParamPowerSumApp:
     def mode_changed(self):
         if self.mode_var.get() == self.DIFF_MODE:
             self.table_msg_var.set('▶ 差分模式：Victim 必须勾选 2 个；攻击端口必须成对勾选'
-                                   '（对子按左侧「排列方式」划分）。')
+                                   '（对子按上方「排列方式」划分）。')
         else:
             self.table_msg_var.set('▶ 单端模式：Victim 仅需勾选 1 个；攻击端口可任意数量(奇/偶)勾选。')
         self._refresh_selection()
@@ -904,12 +1447,14 @@ class SParamPowerSumApp:
 
             if len(freqs) > 1:
                 with self._paused():
-                    # 界面频率输入单位为 Hz, 科学计数法显示;
-                    # fstep 默认取文件原始频点间隔, 可手动修改
-                    self.fmin_var.set(f'{freqs[0]:.6g}')
-                    self.fmax_var.set(f'{freqs[-1]:.6g}')
+                    # 界面频率输入单位为 Hz; fstep 默认取文件原始频点间隔。
+                    # 用 repr 写回最短往返精度的十进制文本, 保证输入框
+                    # 文本与文件值之间零精度损失 (计算链路不允许四舍五入,
+                    # 只有最终 UI 展示数据时才按显示需要格式化)
+                    self.fmin_var.set(repr(float(freqs[0])))
+                    self.fmax_var.set(repr(float(freqs[-1])))
                     self.fstep_var.set(
-                        f'{(freqs[-1] - freqs[0]) / (len(freqs) - 1):.6g}')
+                        repr(float((freqs[-1] - freqs[0]) / (len(freqs) - 1))))
 
             self._build_port_table(num_ports, self.spara_obj.port_names)
 
@@ -1121,7 +1666,7 @@ class SParamPowerSumApp:
         except ValueError as e:
             return str(e)
 
-        # FEXT_dB/NEXT_dB/PSFEXT/PSNEXT/PSXT 在 power_sum_db 中求值,
+        # FEXT_dB/NEXT_dB/PSFEXT/PSNEXT/PSXTLK 在 power_sum_db 中求值,
         # 这里用合成 (2 条路径 x 8 频点) 二维 dB 矩阵单独校验
         env = {'RAW_FEXT_dB': np.tile(-fn / 1e10, (2, 1)),
                'RAW_NEXT_dB': np.tile(-2 * fn / 1e10, (2, 1))}
@@ -1136,7 +1681,7 @@ class SParamPowerSumApp:
                 return (f'公式 {name}: 结果形状 {arr.shape} 与 '
                         f'RAW_{name} {raw.shape} 不一致')
             env[name] = arr
-        for name in ('PSFEXT', 'PSNEXT', 'PSXT'):
+        for name in ('PSFEXT', 'PSNEXT', 'PSXTLK'):
             try:
                 arr = np.asarray(evaluate_expr(formulas[name], env),
                                  dtype=float)
@@ -1157,7 +1702,7 @@ class SParamPowerSumApp:
     def _update_icn_results(self):
         """基于最近一次功率和结果计算 ICN / ccICN 并刷新结果区。
 
-        主界面 ICN 开关关闭时跳过计算; ICN 参数/公式无效时不阻塞
+        左栏 ICN 开关关闭时跳过计算; ICN 参数/公式无效时不阻塞
         功率和曲线 (保持既有行为), 仅在状态栏提示。
         """
         if not self.icn_enabled_var.get():
@@ -1201,7 +1746,7 @@ class SParamPowerSumApp:
             self._redraw_job = None
         # Mark 峰值随每次重绘重新计算 (先清空, 标注时逐条填入)
         self._last_mark_peaks = {}
-        if not self.plot_data or self.ax is None:
+        if not self.plot_data or self.ax is None or self.canvas_mpl is None:
             return
 
         data = self.plot_data
@@ -1214,17 +1759,18 @@ class SParamPowerSumApp:
         if self.chk_next_var.get() and data['has_next']:
             self.ax.plot(data['fn_ghz'], data['MDNEXT'], color='#0072BD',
                          linewidth=1.5, label='Power Sum NEXT')
-        if self.chk_psxt_var.get() and (data['has_fext'] or data['has_next']):
-            self.ax.plot(data['fn_ghz'], data['PSXT'], color='#77AC30',
-                         linewidth=2, label='Total PSXT')
+        if self.chk_psxtlk_var.get() and (data['has_fext'] or data['has_next']):
+            self.ax.plot(data['fn_ghz'], data['PSXTLK'], color='#77AC30',
+                         linewidth=2, label='Total PSXTLK')
 
         self._annotate_mark_peak(data)
 
-        self.ax.set_xlabel('Frequency (GHz)', fontweight='bold')
-        self.ax.set_ylabel('Magnitude (dB)', fontweight='bold')
+        fs = self._plot_fontsize()
+        self.ax.set_xlabel('Frequency (GHz)', fontsize=fs, fontweight='bold')
+        self.ax.set_ylabel('Magnitude (dB)', fontsize=fs, fontweight='bold')
         if self.ax.lines:
-            self.ax.legend(loc='best', fontsize=9)
-        self.ax.tick_params(labelsize=9)
+            self.ax.legend(loc='best', fontsize=fs - 1)
+        self.ax.tick_params(labelsize=fs - 1)
         self.fig.tight_layout()
         self.canvas_mpl.draw()
         self._refresh_data_table()
@@ -1248,7 +1794,7 @@ class SParamPowerSumApp:
         series = (
             ('PSFEXT', 'MDFEXT', 'has_fext', self.chk_fext_var, '#D95319'),
             ('PSNEXT', 'MDNEXT', 'has_next', self.chk_next_var, '#0072BD'),
-            ('PSXT', 'PSXT', None, self.chk_psxt_var, '#77AC30'),
+            ('PSXTLK', 'PSXTLK', None, self.chk_psxtlk_var, '#77AC30'),
         )
         points = []
         for name, key, flag, chk, color in series:
@@ -1270,11 +1816,12 @@ class SParamPowerSumApp:
 
         for (x, y, color), offset in zip(points, offsets):
             self.ax.plot(x, y, 'o', markeredgecolor='k', markerfacecolor=color,
-                         markersize=6, zorder=5)
+                         markersize=7, zorder=5)
             self.ax.annotate(
                 f'{y:.2f} dB', (x, y), xytext=offset,
                 textcoords='offset points', color=color, fontweight='bold',
-                fontsize=8, arrowprops=dict(arrowstyle='->', color=color, lw=0.8),
+                fontsize=max(8, self._plot_fontsize() - 2),
+                arrowprops=dict(arrowstyle='->', color=color, lw=0.8),
                 bbox=dict(boxstyle='round,pad=0.3', fc='white', ec=color, alpha=0.85))
 
     # -------------------- 配置文件读写 --------------------
@@ -1316,6 +1863,12 @@ class SParamPowerSumApp:
             for key, attr in self._SCALAR_FIELDS:
                 if key in saved:
                     getattr(self, attr).set(saved[key])
+            # 旧配置 (PSXT 改名 PSXTLK 之前) 的遗留键, 仅在新键缺失时补读
+            for old_key, attr in self._LEGACY_SCALAR_ALIAS.items():
+                new_key = next((k for k, a in self._SCALAR_FIELDS if a == attr),
+                               None)
+                if old_key in saved and (new_key is None or new_key not in saved):
+                    getattr(self, attr).set(saved[old_key])
             if num_ports:
                 for key, idx in self._PORT_FIELDS:
                     for p in saved.get(key, []):

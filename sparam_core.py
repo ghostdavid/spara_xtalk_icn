@@ -3,7 +3,7 @@
 纯数值模块，不依赖任何 GUI 库：
 - SParameter: Touchstone .sNp 文件解析器
 - snp2smp / s2sdd / safe_db: S 参数数学工具
-- power_sum_db: PSFEXT / PSNEXT / PSXT 功率和计算
+- power_sum_db: PSFEXT / PSNEXT / PSXTLK 功率和计算
 
 从 V3.3 单文件版本重构而来，解析语义与原实现保持一致，
 仅修复以下边缘问题：
@@ -400,18 +400,18 @@ def resample_sparams(spara, z0, fmin_ghz, fmax_ghz, fstep_ghz):
 
 def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
                  fmin_ghz, fmax_ghz, formulas=None):
-    """计算 PSFEXT / PSNEXT / PSXT 功率和曲线。
+    """计算 PSFEXT / PSNEXT / PSXTLK 功率和曲线。
 
     spara: SParameter 实例; 端口号均为 1 起始。
     差分模式: v_ports 恰好 2 个, f/n_ports 按"列表中相邻两个为一对"
       处理 (s2sdd 混合模转换); 对子顺序由调用方按 DUT 引脚排列
       整理好 (见 order_ports_by_pairs), 本函数不猜测配对关系;
     单端模式: v_ports 1 个, f/n_ports 逐端口取 S[v, k]。
-    formulas: dict, 含 FEXT_dB/NEXT_dB/PSFEXT/PSNEXT/PSXT 五条公式
+    formulas: dict, 含 FEXT_dB/NEXT_dB/PSFEXT/PSNEXT/PSXTLK 五条公式
       (缺省用 DEFAULT_FORMULAS); 公式环境提供二维 dB 矩阵
       RAW_FEXT_dB / RAW_NEXT_dB (行=攻击路径, 列=频点),
-      PSXT 公式可引用已求出的 PSFEXT/PSNEXT。
-    返回 dict: fn_ghz / fn_hz / deltaf_hz / MDFEXT / MDNEXT / PSXT /
+      PSXTLK 公式可引用已求出的 PSFEXT/PSNEXT。
+    返回 dict: fn_ghz / fn_hz / deltaf_hz / MDFEXT / MDNEXT / PSXTLK /
       has_fext / has_next / fext_power_lin / next_power_lin。
 
     不做任何插值: 计算直接在 spara.frequencies 给定的频点网格上进行,
@@ -503,7 +503,7 @@ def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
     env['PSFEXT'] = mdfext
     mdnext = eval_curve('PSNEXT')
     env['PSNEXT'] = mdnext
-    psxt = eval_curve('PSXT')
+    psxtlk = eval_curve('PSXTLK')
 
     return {
         'fn_ghz': fn_ghz,
@@ -511,7 +511,7 @@ def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
         'deltaf_hz': deltaf,
         'MDFEXT': mdfext,
         'MDNEXT': mdnext,
-        'PSXT': psxt,
+        'PSXTLK': psxtlk,
         'has_fext': len(f_ports) > 0,
         'has_next': len(n_ports) > 0,
         # ICN 积分所需的线性功率和, 由公式求值结果直接还原,
@@ -532,7 +532,7 @@ def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
 #   常量: pi, e
 # 求值顺序: 标量中间量 -> 矢量 (Wnt/Wft/ChannelLoss) -> 标量结果。
 #
-# PSFEXT/PSNEXT/PSXT 与 FEXT_dB/NEXT_dB 五条公式在 power_sum_db 中
+# PSFEXT/PSNEXT/PSXTLK 与 FEXT_dB/NEXT_dB 五条公式在 power_sum_db 中
 # 求值, 环境为:
 #   RAW_FEXT_dB / RAW_NEXT_dB: (路径数, 频点数) 二维 dB 矩阵,
 #     即从 S 参数直接提取的各攻击路径耦合 (单端: 20log10|S(v,k)|;
@@ -540,15 +540,15 @@ def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
 #   FEXT_dB / NEXT_dB 公式默认恒等引用 RAW 矩阵, 可编辑
 #     (如对数域加权), 结果形状必须与 RAW 矩阵一致;
 #   psum: 按路径维 (axis=0) 求和的专用函数;
-#   PSXT 公式可引用已求出的 PSFEXT / PSNEXT。
-# 求值顺序: FEXT_dB -> NEXT_dB -> PSFEXT -> PSNEXT -> PSXT。
+#   PSXTLK 公式可引用已求出的 PSFEXT / PSNEXT。
+# 求值顺序: FEXT_dB -> NEXT_dB -> PSFEXT -> PSNEXT -> PSXTLK。
 
 DEFAULT_FORMULAS = {
     'FEXT_dB': 'RAW_FEXT_dB',
     'NEXT_dB': 'RAW_NEXT_dB',
     'PSFEXT': '10*log10(psum(pow(10,FEXT_dB/10)))',
     'PSNEXT': '10*log10(psum(pow(10,NEXT_dB/10)))',
-    'PSXT': '10*log10(pow(10,PSFEXT/10)+pow(10,PSNEXT/10))',
+    'PSXTLK': '10*log10(pow(10,PSFEXT/10)+pow(10,PSNEXT/10))',
     'deltaf': 'fstep',
     'fr': '1.5*(fb/2)',
     'ft_n': '0.2365/Tnt',
